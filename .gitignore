@@ -1,0 +1,11 @@
+# Ignore everything by default
+*
+
+# Except these
+!README.md
+!shangbankanqiu/
+!shangbankanqiu/**
+!.gitignore
+
+# shangbankanqiu skill config (contains webhook secrets)
+shangbankanqiu/config.json

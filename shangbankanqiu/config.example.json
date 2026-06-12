@@ -1,0 +1,17 @@
+{
+  "_说明": "复制此文件为 config.json 并填入你的实际配置。至少配置飞书或钉钉中的一个平台。",
+  "_comment_feishu": "飞书群机器人配置 — 从飞书群设置 → 群机器人 → 自定义机器人 获取",
+  "feishu": {
+    "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxx",
+    "secret": ""
+  },
+  "_comment_dingtalk": "钉钉群机器人配置 — 从钉钉群设置 → 智能群助手 → 自定义机器人 获取",
+  "dingtalk": {
+    "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxxx",
+    "secret": ""
+  },
+  "_comment_poll": "轮询间隔，单位秒，默认 180（3分钟），建议不低于 60 秒",
+  "poll_interval_seconds": 180,
+  "_comment_language": "播报语言，默认 zh-CN",
+  "language": "zh-CN"
+}
