@@ -19,5 +19,11 @@
   "_comment_state_file": "去重用临时文件，存上一轮比分，路径相对 skill 目录",
   "state_file": ".shangbankanqiu_state.json",
   "_comment_language": "播报语言，默认 zh-CN",
-  "language": "zh-CN"
+  "language": "zh-CN",
+  "_comment_include_events": "是否在比分推送的同时抓取并广播比赛内事件（goal / foul / sub 等）。true=开启，false=纯比分播报",
+  "include_events": true,
+  "_comment_max_events_per_msg": "每次推送最多附带的事件条数，范围 1-20。钉钉 markdown 约 20KB 上限，推荐 4-8",
+  "max_events_per_msg": 6,
+  "_comment_commentary_dedup_window": "事件 ring buffer 记多少轮的 id_hash，范围 1-200。容量 = window × max_events_per_msg，默认 30 × 6 = 180 条（约 9KB）",
+  "commentary_dedup_window": 30
 }

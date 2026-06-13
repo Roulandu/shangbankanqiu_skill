@@ -8,6 +8,7 @@
 
 - 🔍 自动搜索正在进行的比赛
 - 📊 每 3 分钟更新一次赛况
+- 📋 不只是比分——还会推送实时事件（进球、换人、犯规、关键球、红黄牌等），让你不在场也能跟上比赛节奏
 - 📲 通过飞书/钉钉群机器人推送到你的工作群
 - 🏀 支持 NBA、⚽ 世界杯（更多赛事陆续支持中）
 
@@ -86,7 +87,12 @@ cp config.example.json config.json
   "max_polls": 60,                 // 单次最多轮询多少次（防无限循环），默认 60
   "max_consecutive_failures": 3,   // 连续失败几次后停止轮询
   "state_file": ".shangbankanqiu_state.json", // 去重用临时文件
-  "language": "zh-CN"              // 播报语言
+  "language": "zh-CN",             // 播报语言
+
+  // === 实时事件相关（commentary）===
+  "include_events": true,          // 是否在比分基础上附带实时事件（进球/换人/犯规等），默认 true；设为 false 则退化为纯比分播报
+  "max_events_per_msg": 6,         // 每次推送最多附带的事件条数（建议 4-8；钉钉 markdown 字段约 20KB 硬上限，过多易被截断）
+  "commentary_dedup_window": 30    // 事件去重环形缓冲「记多少轮」（注意是轮数，不是事件条数）。实际容量 = window × max_events_per_msg，默认 30 × 6 = 180 条 id_hash（state 文件约 9KB）
 }
 ```
 
@@ -125,12 +131,23 @@ cp config.example.json config.json
     ↓
 询问比赛类型（NBA / 世界杯）
     ↓
-搜索当前比赛状态
+搜索当前比赛状态  → 顺手嗅探 play-by-play / 文字实录 URL（Stage A）
     ↓
 ┌─ 已完结 → 发送最终赛果 → 结束
 ├─ 未开始 → 发送赛事前瞻 → 结束
-└─ 正在直播 → 发送实时播报 → 等待3分钟 → 重新搜索 → 循环直到比赛结束
+└─ 正在直播
+       ↓
+   [若 include_events=true 且 Stage A 拿到 URL]
+        webfetch 抓取该页 + LLM 提取最新事件（Stage B）
+       ↓
+   渲染消息（比分 + 事件列表，事件可为空）
+       ↓
+   推送到飞书 / 钉钉
+       ↓
+   等待 3 分钟 → 重新搜索 → 循环直到比赛结束
 ```
+
+> Stage A 失败（嗅探不到 URL）或 Stage B 失败（webfetch 超时 / 解析失败）时，事件列表退化为空，**比分照常推送**——不会因为抓不到 commentary 就漏掉这一轮播报。
 
 ## 常见问题
 
