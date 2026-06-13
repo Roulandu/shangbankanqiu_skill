@@ -1515,7 +1515,7 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
 
 **消息体示例 — 实时播报（含事件列表，4 元素布局）**:
 
-当 `include_events=true` 且本轮成功抓到事件时，飞书卡片采用 **4 元素布局**（`div-score` / `div-events` / `hr` / `note`）。`div-events` 的 `lark_md` 正文以 `📋 **实时事件**\n` 起头，每条事件占一行 bullet。`emoji_for(e)` 严格遵循 §Event 类型 → emoji 映射 表（合法 type 仅有：`goal`/⚽ 或 🏀、`score`/🎯、`foul`/🟨、`card`/🟥、`sub`/🔄、`key_play`/⭐、`other`/•）。**绝不**虚构 `yellow_card` / `red_card` 等枚举外类型——红黄牌统一用 `card` + text 描述区分（如 `text="梅西吃到本场第二张黄牌被罚下"`）。
+当 `include_events=true` 且本轮成功抓到事件时，飞书卡片采用 **4 元素布局**（`div-score` / `div-events` / `hr` / `note`）。`div-events` 的 `lark_md` 正文以 `📋 **实时事件**\n` 起头，每条事件占一行 bullet。`emoji_for(e)` 严格遵循 §Event 类型 → emoji 映射 表（合法 type 仅有 6 个：`goal`/⚽ 或 🏀、`foul`/🟨、`card`/🟥、`sub`/🔄、`key_play`/⭐、`other`/•）。**绝不**虚构 `yellow_card` / `red_card` / `score` 等枚举外类型——红黄牌统一用 `card` + text 描述区分（如 `text="梅西吃到本场第二张黄牌被罚下"`）；篮球得分（投篮命中 / 三分 / 篮球得分行）统一用 `goal`，**不要**用 `score`（已从枚举里移除）。
 
 ```json
 {
