@@ -12,6 +12,12 @@
   },
   "_comment_poll": "轮询间隔，单位秒，默认 180（3分钟），建议不低于 60 秒",
   "poll_interval_seconds": 180,
+  "_comment_max_polls": "单次 skill 运行最多轮询多少轮，防止无限循环。60 ≈ 3 小时",
+  "max_polls": 60,
+  "_comment_max_failures": "连续失败几次后停止轮询（搜索失败 + 推送失败合并计数）",
+  "max_consecutive_failures": 3,
+  "_comment_state_file": "去重用临时文件，存上一轮比分，路径相对 skill 目录",
+  "state_file": ".shangbankanqiu_state.json",
   "_comment_language": "播报语言，默认 zh-CN",
   "language": "zh-CN"
 }

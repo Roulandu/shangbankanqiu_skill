@@ -82,12 +82,31 @@ cp config.example.json config.json
     "webhook_url": "钉钉机器人 Webhook 地址",
     "secret": "加签密钥 SEC（没有则留空）"
   },
-  "poll_interval_seconds": 180,  // 轮询间隔（秒），默认3分钟
-  "language": "zh-CN"            // 播报语言
+  "poll_interval_seconds": 180,    // 轮询间隔（秒），默认3分钟
+  "max_polls": 60,                 // 单次最多轮询多少次（防无限循环），默认 60
+  "max_consecutive_failures": 3,   // 连续失败几次后停止轮询
+  "state_file": ".shangbankanqiu_state.json", // 去重用临时文件
+  "language": "zh-CN"              // 播报语言
 }
 ```
 
 至少配置飞书或钉钉中的一个。
+
+## ⚠ 设计原则：本 Skill 不会后台化
+
+很多人误以为「每 3 分钟推送一次」就需要后台 daemon / cron / 计划任务。本 Skill **故意不那样设计**：
+
+- **轮询循环跑在宿主 Agent 的当前对话里**，sleep 是**前台同步阻塞**（`Start-Sleep` / `sleep`）
+- **不会**让 Agent 创建 `.py` / `.sh` / `.ps1` 调度脚本
+- **不会**用 `nohup` / `&` / `setInterval` / `crontab` 等任何后台化手段
+
+这样设计的好处：
+1. 跨 Agent 一致——codex / cursor / opencode / claude code 走出同样的对话流
+2. 易于停止——你在该对话里说「停止」就能终止（最长等待约 60 秒，因为 sleep 按 60 秒切片执行）
+3. 不污染系统——不留下 cron 条目、不留下 daemon 进程、不抢占端口
+4. 你的 codex/cursor/opencode/claude code **应用本身**（在新对话/新窗口）不受影响，依然能正常用来写代码
+
+如果你需要 Agent 在轮询的同时干别的活，请新开一个 Agent 实例/对话；**不要**改本 Skill 让它后台化。
 
 ## 支持的赛事
 
