@@ -293,7 +293,7 @@ while poll_idx < config.max_polls:
 
     # 2c. 给每个 match 挂上 new_events（post-dedup + trim 到 max_events_per_msg，保留最新 N 条）
     #      —— render_live 会从 m.new_events 平铺到 msg.events（见 §render_live 伪代码）
-    cap_msg = config.max_events_per_msg
+    cap_msg = config["max_events_per_msg"]   # 等价 config.max_events_per_msg；本 SKILL 中 config.X 与 config["X"] 互通（dict 访问）
     for m in fresh:
         # NOTE（P2-7）：m.get("events", [])，而非 m.events / hasattr——见上方 2a 同名注释
         m["new_events"] = [e for e in m.get("events", [])
@@ -383,6 +383,7 @@ EXIT
 | `ask_user_if_missing(field, prompt)` / `ask_user_optional(...)` | 当 config 字段为空/未填 → 在对话里向用户追问 | 各 Agent 用自己的 `ask` / `question` / 直接用文本提问皆可——本 skill **不依赖** 任何特定的 question 工具 |
 | `host_agent_self_reason(prompt)` | 「让宿主 Agent 自己 LLM backbone 处理这段 prompt」（详见 §`llm_extract_events`） | 不是函数调用——Agent 把 prompt 当作自己 reasoning step 的输入，再读出输出 |
 | 标准库函数：`sha1`、`json.loads`、`JSONDecodeError`、`hmac`、`base64`、`time` | 标准库等价物 | Python 直接用 `hashlib.sha1` 等；其他语言用各自标准库的等价 API |
+| `config.X` ↔ `config["X"]`（以及 `match.home` ↔ `match["home"]` 等其他**纯读** dict 访问） | 伪代码两种风格**等价**——`config` / `m`（来自 `parse_search_result`）都是 dict | 各 Agent 用自己语言惯用的 dict 访问即可（Python 用 `["X"]` / `.get("X")`；JSON 风格 mock 用 `.X`）。**例外**：写赋值（`match["events"] = [...]` / `m["new_events"] = [...]`）必须用 bracket，不要写 `match.events = [...]`——见 P0-3 / P1-1 教训。 |
 
 **关键非约束**：本节列出的占位符都**不**承担「跨 Agent 一致性」契约——它们只影响日志可读性 / UX 提示文案，输出不进 `id_hash` 计算，不写 state file，不通过 webhook 推送。所以 4 家 Agent 在 `log()` 文案上有微小差异是 OK 的；**真正需要 byte-equal 的是 `id_hash` 算法、prompt 字面、state file schema、webhook body schema**——这些都已经在各自函数里**字面**规定了。
 
@@ -456,7 +457,7 @@ else:
       "id_hash": "<sha1((match_key + '|' + ts + '|' + text).encode('utf-8'))[:12]>",  # 去重键，REQUIRED；算法见下方（必须 byte-equal Stage B）
       "ts":      "21'" | "Q3 4:32" | "HT" | "",         # 比赛时钟字符串，REQUIRED（可为 ""）
       "team":    "home" | "away" | "",                  # 归属队；中性事件留 ""
-      "type":    "goal" | "score" | "foul" | "sub" | "card" | "key_play" | "other",
+      "type":    "goal" | "foul" | "sub" | "card" | "key_play" | "other",   # 6 个枚举（与 §llm_extract_events VALID_TYPES byte-equal）
       "text":    "≤80 个中文字符的单行描述"
     }
   ]
@@ -511,7 +512,7 @@ id_hash   = sha1((match_key + "|" + ts + "|" + text).encode("utf-8")).hexdigest(
       "ts":      "Q3 6:48",
       "team":    "away",
       "text":    "塔图姆三分命中，凯尔特人追到只差 1 分",
-      "type":    "score"
+      "type":    "goal"
     },
     {
       "id_hash": "112233445566",
@@ -1097,8 +1098,15 @@ def render_live(fresh, last_pushed_score, score_snapshot):
 把 `fresh`（`parse_search_result` 返回的 match dict 列表）压成一个**稳定可比较的快照**，喂给 `scores_equal` 和 `write_state_file_safely`：
 
 ```text
+# CRITICAL（P1-1, Oracle Round 12 一致）：m 是 dict（§parse_search_result 输出），
+# 必须用 m["..."] / m.get("...") 访问。**绝不**写 m.home / m.away（getattr-on-dict 静默失败陷阱）。
 return [
-  { "home": m.home, "away": m.away, "score": m.score, "phase": m.phase }
+  {
+    "home":  m.get("home", ""),
+    "away":  m.get("away", ""),
+    "score": m.get("score", ""),
+    "phase": m.get("phase", ""),
+  }
   for m in fresh
   # 不要包含 summary / source_url / raw / events 等会自然抖动的字段
 ]
@@ -1165,15 +1173,14 @@ return msg
 
 | `event.type` | emoji | 含义 / 适用场景 |
 |--------------|-------|-----------------|
-| `goal` | ⚽ (足球) / 🏀 (篮球) | 进球。Agent 按本场比赛 `match_type` 选择：足球用 ⚽，篮球用 🏀。 |
-| `score` | 🎯 | 篮球得分行（非 goal 但分数有变动），或足球点球转化等额外得分。 |
+| `goal` | ⚽ (足球) / 🏀 (篮球) | 进球 / 得分（含投篮命中、三分球、篮球得分行、足球点球转化等任何分数有变动的事件）。Agent 按本场比赛 `match_type` 选择：足球用 ⚽，篮球用 🏀。 |
 | `foul` | 🟨 | 犯规（含技术犯规、普通犯规） |
 | `card` | 🟥 | 红牌 / 重大处罚（与 foul 区分：foul = 黄牌或以下，card = 红牌级别） |
 | `sub` | 🔄 | 换人 |
 | `key_play` | ⭐ | 关键回合（关键三分、绝杀、扑点等） |
 | `other` | • | 其他杂项事件，使用通用项目符号 |
 
-> 实现注：`goal` 行展示时由渲染器根据 `match_type`（或 `match.home` / `match.away` 联赛上下文）二选一；其余 6 个 emoji 跨赛事一致。
+> 实现注：`goal` 行展示时由渲染器根据 `match_type`（或 `match.home` / `match.away` 联赛上下文）二选一；其余 5 个 emoji 跨赛事一致。
 
 **`render_feishu_card(msg)`** → 按 §飞书消息格式 组装为「N 元素」卡片（N ∈ {3, 4}）：
 
@@ -1199,7 +1206,7 @@ if len(msg.events) > 0:
 elements.append({ "tag": "hr" })                                                       # 分隔线
 elements.append({ "tag": "note", "elements": [{
     "tag": "plain_text",
-    "content": "更新时间 " + msg.timestamp + " · 数据来源：网络搜索"
+    "content": msg.footer    # e.g. "🤖 上班看球播报员 | 下次更新: 3分钟后" —— 与 §msg schema (msg.footer) byte-equal，与 §等价 JSON 模板示例一致
 }] })                                                                                  # 注脚
 
 # 等价 JSON 模板（仅 msg.events 非空时整 4 元素，msg.events 空时退化为 3 元素）：
