@@ -1,4 +1,4 @@
-﻿---
+---
 name: shangbankanqiu
 description: 上班看球 — 实时比赛播报，支持世界杯/NBA等赛事，通过飞书/钉钉群机器人推送赛况。本 Skill 不启动任何后台脚本/守护进程，所有工作完全在宿主 Agent 的对话循环内同步进行，因此 codex / cursor / opencode / claude code 都能一致地按相同协议执行。
 argument-hint: "<比赛类型: 世界杯 | NBA>"
@@ -599,6 +599,244 @@ for match in matches:
 #         不写 state_file，不发推送。零副作用。
 ```
 
+##### `pick_playbyplay_url_from_stage_a(match)` —— Stage A → Stage B URL 选择器
+
+**P0-1 fix (Oracle Round 11)**：本函数必须在所有 4 家 Agent 中以**完全相同**的算法实现。绝不让 LLM 自由发挥——按下方决策树字面量执行，否则跨 Agent 不一致。
+
+**输入**：单场 match dict（来自 §parse_search_result，含 `home`/`away`/`source_url`/`raw` 字段）
+
+**输出**：play-by-play URL 字符串，或 `None`（找不到任何匹配候选）
+
+**算法（决策树，严格按顺序匹配，找到第一个就返回）**：
+
+```text
+def pick_playbyplay_url_from_stage_a(match):
+    """
+    扫描 match 自身携带的 URL 候选池，按 §Stage B 5 行优先级表逐行匹配；
+    第一行命中即返回该 URL，零命中返回 None。
+    禁止：发起新的 web_search、调用任何 LLM、向其他场比赛借 URL。
+    """
+    # 1. 收集候选 URL 池（仅来自当前 match 自身，不跨场借用）
+    candidates = []
+    if match.get("source_url"):
+        candidates.append(match["source_url"])
+    raw_text = match.get("raw", "") or ""
+    candidates.extend(extract_urls_from_text(raw_text))   # 见下方辅助函数
+    # 去重，保留首次出现顺序
+    seen = set(); pool = []
+    for u in candidates:
+        if u and u not in seen:
+            seen.add(u); pool.append(u)
+    if not pool:
+        return None
+
+    # 2. 按 §Stage B 源优先级表（行 1→5）依次匹配，第一行命中即返回
+    #    NOTE：严格按表内字面量 host 段匹配，不做模糊化、不调 LLM 判断
+    PRIORITY_PATTERNS = [
+        # (行号, 联赛域, host 子串列表, path 子串列表)
+        (1, "NBA",    ["nba.hupu.com"],
+                      ["/games/", "/livecast"]),                 # 行 1: 虎扑 NBA 文字直播（首选）
+        (2, "NBA",    ["espn.com"],
+                      ["/nba/playbyplay"]),                      # 行 2: ESPN NBA play-by-play（兜底，英文）
+        (3, "soccer", ["espn.com"],
+                      ["/soccer/commentary", "/soccer/match"]),  # 行 3: ESPN soccer commentary（足球首选）
+        (4, "soccer", ["match.sports.sina.com.cn",
+                       "sports.sina.com.cn"],
+                      ["/livecast", "/live.php"]),               # 行 4: 新浪足球直播间（兜底, 可能 SPA）
+        (5, "any",    ["nba.sina.com.cn", "zhibo8.cc"],
+                      []),                                       # 行 5: discovery-only / SPA 壳（最低优先级）
+    ]
+
+    for _row, _league, host_subs, path_subs in PRIORITY_PATTERNS:
+        for url in pool:
+            host = url_host(url)                    # e.g. "nba.hupu.com"
+            path = url_path(url)                    # e.g. "/games/12345"
+            if not any(h in host for h in host_subs):
+                continue
+            if path_subs and not any(p in path for p in path_subs):
+                continue
+            return url                              # 命中第一行，返回
+
+    # 3. 5 行全部 miss → None（Stage B 进入 graceful=[] 路径）
+    return None
+
+
+# === 辅助函数（4 家 Agent 必须用等价实现） =================================
+def extract_urls_from_text(text):
+    """从任意文本里抽取 http(s):// URL；纯字符串扫描，无 LLM。"""
+    # Python:  re.findall(r"https?://[^\s)\]\"'<>]+", text)
+    # JS:      text.match(/https?:\/\/[^\s)\]"'<>]+/g) || []
+    # 返回 list[str]，保持出现顺序。
+    ...
+
+def url_host(url):
+    """返回 URL 的 host 段（小写）。例: https://nba.hupu.com/games/123 → "nba.hupu.com"。"""
+    # Python:  urllib.parse.urlparse(url).hostname.lower() or ""
+    # JS:      new URL(url).hostname.toLowerCase()
+    ...
+
+def url_path(url):
+    """返回 URL 的 path 段。例: https://nba.hupu.com/games/123?x=1 → "/games/123"。"""
+    # Python:  urllib.parse.urlparse(url).path or ""
+    # JS:      new URL(url).pathname
+    ...
+```
+
+**确定性保证**：4 家 Agent 给定同一份 `match` dict、同一份 URL 候选池，**必须**返回同一个 URL（或同时 None）。`PRIORITY_PATTERNS` 表是单一真理源——任何 host/path 子串调整必须同步改本表，禁止 Agent 自行扩列表。
+
+
+##### `llm_extract_events(page_md, match_key, schema)` —— Stage B LLM 事件抽取
+
+**P0-2 fix (Oracle Round 11)**：本函数被 §Stage B Step 2b 调用但缺定义。4 家 Agent 必须按下方 prompt 字面量执行 LLM 调用，否则跨 Agent 抽出的 event 集合不一致 → `id_hash` 不一致 → 去重失效 → 重复推送同一事件。
+
+**输入**：
+- `page_md`：webfetch 拿到的 markdown（已剥 HTML，含文字直播主体）
+- `match_key`：`match.home + "|" + match.away`（用于算 id_hash 时拼前缀）
+- `schema`：字符串描述（仅用于 prompt 提示，实际输出格式见下方 JSON schema）
+
+**输出**：list of event dict，每个 dict 严格如下结构：
+
+```json
+{
+  "id_hash": "12-char hex",       // sha1(match_key + ts + text)[:12]
+  "ts":      "MM:SS or P-MM:SS",  // 比赛内时钟 (e.g. "Q3-08:32" / "45+2'" / "10:24")
+  "team":    "home|away|null",    // 事件归属，无法判定时填 null
+  "type":    "goal|foul|sub|card|key_play|other",   // 6 个枚举值之一
+  "text":    "string"             // 一行人类可读描述 (≤ 80 字符)
+}
+```
+
+**算法（伪代码，4 家 Agent 用同一份 prompt + 同一份解析逻辑）**：
+
+```text
+def llm_extract_events(page_md, match_key, schema):
+    """
+    把 webfetch 拿到的文字直播 markdown 喂给 LLM，让它按 schema 抽取事件。
+    禁止：写正则裸抽 / 写 .py 脚本 / 调外部 NLP 服务。
+    硬约束：4 家 Agent 必须用下方字面 prompt，连标点都不许改——
+            因为 prompt 字面差异会导致同一段 markdown 抽出不同的事件文本，
+            进而 id_hash 不一致 → 跨 Agent 去重失效。
+    """
+    # 1. 输入大小防御：超过 60KB 截断（防止 prompt 爆 LLM 上下文）
+    if len(page_md) > 60_000:
+        page_md = page_md[-60_000:]   # 取末尾，因为最新事件通常在页面底部
+
+    # 2. 字面 prompt（HARD CONTRACT，4 家 Agent 不许改字符）
+    prompt = """你是一个体育赛事文字直播解析器。下面是一段 markdown 格式的比赛文字直播页面。
+
+请按时间倒序扫描，抽取最近发生的所有事件，每条事件必须包含 5 个字段：
+
+- ts:   比赛内时钟字符串。NBA 用 "Q1-11:45" / "Q4-02:13" / "OT-04:00"；足球用 "12'" / "45+2'" / "67'"；其他用页面原始时钟字符串。
+- team: 事件归属方。明确属于主队填 "home"，客队填 "away"，无法判定填 null。**不要瞎猜**——宁可填 null。
+- type: 必须是以下 6 个枚举值之一：
+        - goal      (进球 / 得分 / 投篮命中 / 三分球)
+        - foul      (犯规 / 违例)
+        - sub       (换人)
+        - card      (黄牌 / 红牌)
+        - key_play  (关键回合 / 抢断 / 盖帽 / 助攻 / 关键传球)
+        - other     (其他不便归类的)
+- text: 一行人类可读描述，必须 ≤ 80 个字符。中文优先。不要复述时钟。例：「詹姆斯三分命中」「孙兴慜被换下」。
+- id_hash: 留空字符串 ""，由调用方计算填入，**LLM 不要算**。
+
+输出格式：严格的 JSON 数组，不许有任何 markdown 围栏（不要 ```json）、不许有解释文字。
+顺序：按页面里的事件出现顺序（通常是时间倒序，最新在前）。
+数量：最多输出 30 条，超过的略掉。
+找不到任何事件 / 页面是空壳 / 解析失败 → 输出 `[]`（空数组）。
+
+== 比赛标识 ==
+%MATCH_KEY%
+
+== 文字直播页面（markdown） ==
+%PAGE_MD%
+""".replace("%MATCH_KEY%", match_key).replace("%PAGE_MD%", page_md)
+
+    # 3. 让宿主 Agent 自己 reason（IMPORTANT：这不是个真函数——
+    #    `host_agent_self_reason()` 只是伪代码占位符，表示「把上面的 prompt 当作
+    #    本 Agent 自己的下一步 reasoning 输入，让 LLM backbone 自己产出 JSON 字符串」）。
+    #    具体到 4 家 Agent 的语义：
+    #    - codex / cursor / opencode / claude code：在轮询循环的当前 turn 内，
+    #      Agent 把 prompt 文本当作下一个推理步的输入——本质上就是 Agent 自己「读了
+    #      page_md，照着 prompt 描述抽事件」，输出落到一个变量（伪代码记为 llm_raw）。
+    #    禁止调外部 LLM API（OpenAI / Anthropic / Bailian 等独立 API）——因为：
+    #    (a) 用户没在 config 里配 API key
+    #    (b) 跨 Agent 走不同 LLM 后端会破坏「字面相同」的硬约束 → id_hash 漂移
+    try:
+        # llm_raw = <this Agent's own reasoning output, given `prompt` as input>
+        llm_raw = host_agent_self_reason(prompt, max_tokens=4000, temperature=0.0)
+    except (timeout / llm_error):
+        log_warning("llm_extract_events: LLM call failed, returning []")
+        return []
+
+    # 4. 解析 + 校验
+    try:
+        events = json.loads(llm_raw.strip())
+    except (JSONDecodeError):
+        # LLM 偶尔会包 ```json ... ``` 围栏，做一次容错剥离
+        stripped = strip_markdown_fences(llm_raw)
+        try:
+            events = json.loads(stripped)
+        except (JSONDecodeError):
+            log_warning("llm_extract_events: cannot parse LLM output as JSON, returning []")
+            return []
+
+    if not isinstance(events, list):
+        log_warning("llm_extract_events: LLM did not return a list, returning []")
+        return []
+
+    # 5. 逐条校验 + 计算 id_hash + 强行修剪
+    VALID_TYPES = {"goal", "foul", "sub", "card", "key_play", "other"}
+    cleaned = []
+    for ev in events[:30]:                       # 硬上限 30 条
+        if not isinstance(ev, dict):
+            continue
+        ts   = str(ev.get("ts",   "")).strip()
+        team = ev.get("team")
+        if team not in ("home", "away", None):
+            team = None
+        ev_type = str(ev.get("type", "other")).strip().lower()
+        if ev_type not in VALID_TYPES:
+            ev_type = "other"
+        text = str(ev.get("text", "")).strip()[:80]   # 80 字符硬截断
+
+        if not ts or not text:                   # ts 或 text 为空 → 丢弃
+            continue
+
+        # id_hash 算法 = §parse_search_result 已规定，4 家 Agent byte-equal
+        id_hash = sha1((match_key + "|" + ts + "|" + text).encode("utf-8")).hexdigest()[:12]
+
+        cleaned.append({
+            "id_hash": id_hash,
+            "ts":      ts,
+            "team":    team,
+            "type":    ev_type,
+            "text":    text,
+        })
+
+    return cleaned
+
+
+# === 辅助：剥 markdown 围栏（``` 开头/结尾） =================================
+def strip_markdown_fences(text):
+    """
+    输入: '```json\n[{"a":1}]\n```'  → 输出: '[{"a":1}]'
+    输入: '```\n[1,2]\n```'           → 输出: '[1,2]'
+    没围栏: 原样返回。
+    """
+    s = text.strip()
+    if s.startswith("```"):
+        # 去掉首行 ``` 或 ```json
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl+1:]
+    if s.endswith("```"):
+        s = s[:-3].rstrip()
+    return s
+```
+
+**确定性保证**：4 家 Agent 给定同一份 `page_md` + 同一个 `match_key`，`temperature=0.0` 下 LLM 输出**应当**字符一致；即便有 1–2 字差异，经过 `cleaned` 步骤的字段标准化 + `id_hash` 计算后，集合应等价。如果某家 Agent 的 LLM 后端不支持 `temperature=0.0`，必须填它支持的最低温度（如 Codex 默认走的是 GPT-5 / Claude Sonnet 4，都支持 `0.0`）。
+
+**为什么禁止外部 LLM API**：(a) 用户 config 里没要求填 OPENAI_API_KEY；(b) 跨 Agent 走不同后端 → prompt 解析路径不同 → events 集合不同 → id_hash 不同 → 去重失效 → 重复推送。
+
 ##### Graceful Degradation（优雅降级 / 优雅跳过）
 
 Stage B 任何一步失败都**不**应该影响主循环的比分推送。明文规定：
@@ -784,9 +1022,12 @@ def render_live(fresh, last_pushed_score, score_snapshot):
 
     # 把每个 match.new_events（由主循环 push gate 预先填充，见 §主循环 push gate）
     # 平铺到 msg.events 数组——见 §msg schema (events 字段)
+    # CRITICAL（P0-3, Oracle Round 11）：m 是 dict，必须用 m.get("new_events", [])。
+    # **绝不**写 getattr(m, "new_events", [])——Python 的 getattr 检查 attribute 不是 dict key，
+    # 对 dict 永远返默认 [] → events 永远渲染不出来 → 整个 events 特性静默失效（与 §主循环 2a/2c 同源 bug）。
     msg.events = []
     for m in fresh:
-        for e in getattr(m, "new_events", []):
+        for e in m.get("new_events", []):
             msg.events.append(e)
     new_events_count = len(msg.events)
 
