@@ -19,8 +19,9 @@ argument-hint: "<比赛类型: 世界杯 | NBA>"
 | 5 | **跨平台一致** | 4 家宿主 Agent (codex / cursor / opencode / claude code) 必须按 §标准协议 走出**步骤一致**的对话流（搜→渲染→发→sleep→搜）。 |
 | 6 | **绝不静默失败** | webhook 调用必须打印 HTTP 响应；连续 N 轮失败必须停止轮询并向用户报告，不得继续 sleep。 |
 | 7 | **BREAK-risk: events 不得进入 snapshot/dedup** | `events` 字段是按事件去重的、自然增长的 list。若把它塞进 `extract_score_snapshot` 的快照、或让 `scores_equal` 对它做 string-diff，会导致每轮快照都「看起来变化」→ dedup 失效 → 推送风暴刷爆群。事件去重的唯一正路是主循环里基于 `seen_event_ids` ring buffer 过滤，**禁止**塞进 snapshot（见 §extract_score_snapshot 排除列表与 §scores_equal 语义）。 |
-| 8 | **BREAK-risk: 钉钉 markdown 20KB 上限** | 钉钉 markdown `text` 字段约 ~20KB 硬上限，超长会被服务端拒收并返回 `errcode != 0`。冗长的 commentary 直接拼接极易超限——`render_dingtalk_md` **必须**走 18000 字节 size guard（见 T10 / §钉钉 18000 字节 size guard），按 FIFO 丢队首事件直到落入阈值，并附「已截断 N 条」标记。 |
+| 8 | **BREAK-risk: 钉钉 markdown 20KB 上限** | 钉钉 markdown `text` 字段约 ~20KB 硬上限，超长会被服务端拒收并返回 `errcode != 0`。冗长的 commentary 直接拼接极易超限——`render_dingtalk_md` **必须**走 18000 字节 size guard（见 T10 / §钉钉 18000 字节 size guard），按 FIFO 丢队首事件直到落入阈值，并附「已截断 N 条」标记。play_by_play 模式事件更多（推荐 `max_events_per_msg=8-12`），size guard 更容易触发，必须确保截断逻辑在两种模式下都正确运行。 |
 | 9 | **BREAK-risk: 真实配置键禁止 `_` 前缀** | `read_config` 通过 `strip_comment_keys` **递归剥离**所有以 `_` 开头的键（见 §read_config）。把 `include_events` / `max_events_per_msg` / `commentary_dedup_window` 等真实配置键写成 `_include_events` 之类会被**静默剥离**——配置看似已填、运行时全是默认值，极难排查。**只有** `_comment_*` 形态的注释兄弟键才能用 `_` 前缀，真实配置键必须**字面量**拼写。 |
+| 10 | **BREAK-risk: play_by_play 模式每轮必推** | `commentary_style == "play_by_play"` 时主循环 push gate **永不跳过**——即使比分未变且无新事件。这是设计意图（用户选择文字直播就是想要持续更新）。若错误地在 play_by_play 模式下沿用 events_only 的 skip 逻辑，会导致文字直播模式下长时间无推送，用户体验退化为"装了文字直播但跟纯比分一样"。 |
 
 ### 🚫 禁止清单（明文黑名单）
 
@@ -149,7 +150,9 @@ Start-Sleep -Seconds 180   # Windows PowerShell
   "language": "zh-CN",
   "include_events": true,
   "max_events_per_msg": 6,
-  "commentary_dedup_window": 30
+  "commentary_dedup_window": 30,
+  "commentary_style": "events_only",
+  "play_by_play_default_poll_interval_seconds": 90
 }
 ```
 
@@ -161,10 +164,12 @@ Start-Sleep -Seconds 180   # Windows PowerShell
 | `state_file` | string | `.shangbankanqiu_state.json` | — | 跨轮去重用的临时状态文件（存上次比分），相对 skill 目录 |
 | `language` | string | `zh-CN` | — | 播报语言 |
 | `include_events` | boolean | `true` | `true` / `false` | 是否在比分推送的同时抓取并广播比赛内事件（goal / foul / sub / key_play 等）。`false` 时整段 Stage B 跳过、所有 match `events=[]`，本 Skill 退化为纯比分播报，详见 §Stage B Graceful Degradation。 |
-| `max_events_per_msg` | integer | 6 | 1–20 | 每次推送最多附带的事件条数。钉钉 markdown `text` 字段约 **20KB** 硬上限——推荐 4–8（再多容易被钉钉服务端截断；详见 §钉钉 18000 字节 size guard）。 |
+| `max_events_per_msg` | integer | 6 | 1–20 | 每次推送最多附带的事件条数。钉钉 markdown `text` 字段约 **20KB** 硬上限——`events_only` 模式推荐 4–8（再多容易被钉钉服务端截断；详见 §钉钉 18000 字节 size guard）；`play_by_play` 模式推荐 8–12（文字直播事件更多，但仍需注意钉钉 size guard）。 |
 | `commentary_dedup_window` | integer | 30 | 1–200 | `seen_event_ids` ring buffer 记多少**轮**的事件 id_hash；buffer 容量 `cap = commentary_dedup_window × max_events_per_msg`。默认 30 × 6 = 180 条 id_hash（state 文件约 9KB）。详见 §state file schema。 |
+| `commentary_style` | string | `"events_only"` | `"events_only"` / `"play_by_play"` | 播报风格。`events_only` = 仅在比分变化或出现进球/犯规等重大事件时推送（当前默认行为）。`play_by_play` = 文字直播模式——像文字解说员一样每轮推送比赛进程，即使比分未变也有叙述更新；LLM 提取更细粒度的事件类型（射门/扑救/角球等），且每轮至少产一条 `commentary` 类型事件描述当前局势。详见 §Stage B LLM prompt 变体 与 §render_live 3×2 状态表。 |
+| `play_by_play_default_poll_interval_seconds` | integer | 90 | ≥ 60 | 文字直播模式推荐的轮询间隔（秒）。当 `commentary_style == "play_by_play"` 且用户未自定义 `poll_interval_seconds`（仍为默认值 180）时，自动使用此值代替，使文字直播更「实时」。用户显式设置了非 180 的 `poll_interval_seconds` 时，以用户设置为准。 |
 
-> **⚠ 配置键命名警告（重申已有规则）**：上表所有「真实键」**绝不**以下划线 `_` 开头；只有 `_comment_*` 形态的注释兄弟键才会被 `strip_comment_keys` 剥离（见 §read_config）。把真实键写成 `_include_events` / `_max_events_per_msg` 之类**会被静默剥离**——配置看起来填了但运行时全是默认值，极难排查。`include_events` / `max_events_per_msg` / `commentary_dedup_window` 三个新键**必须**按本表的字面量拼写出现在 `config.json` 顶层。
+> **⚠ 配置键命名警告（重申已有规则）**：上表所有「真实键」**绝不**以下划线 `_` 开头；只有 `_comment_*` 形态的注释兄弟键才会被 `strip_comment_keys` 剥离（见 §read_config）。把真实键写成 `_include_events` / `_max_events_per_msg` 之类**会被静默剥离**——配置看起来填了但运行时全是默认值，极难排查。`include_events` / `max_events_per_msg` / `commentary_dedup_window` / `commentary_style` / `play_by_play_default_poll_interval_seconds` 所有真实配置键**必须**按本表的字面量拼写出现在 `config.json` 顶层。
 
 至少配置飞书或钉钉中的一个，两个都配置也可以（会同时推送）。
 
@@ -203,7 +208,18 @@ persisted         = prev if isinstance(prev, dict) else {}   # 永远是 dict，
 last_pushed_score = persisted.get("score")              # None 表示首轮
 fail_count        = 0
 poll_idx          = 0
-poll_interval     = max(config.poll_interval_seconds, 60)   # 强制最小 60 秒
+# play_by_play mode recommends shorter intervals for a more "live" feel.
+# If user left poll_interval_seconds at the default 180, auto-reduce to
+# play_by_play_default_poll_interval_seconds (default 90). If user explicitly
+# set a non-default value, respect it.
+# LIMITATION: 代码无法区分「用户主动设了 180」和「默认值 180」——两者在 config 中看起来一样。
+# 如果用户确实想在 play_by_play 模式下用 180 秒间隔，需将 poll_interval_seconds 设为非 180 的值
+# （如 181 或 179），否则会被自动降为 play_by_play_default_poll_interval_seconds。
+base_interval = config.poll_interval_seconds
+if config.get("commentary_style", "events_only") == "play_by_play" and base_interval >= 180:
+    # Only auto-reduce if user hasn't customized (180 = default from config.example.json)
+    base_interval = min(base_interval, config.get("play_by_play_default_poll_interval_seconds", 90))
+poll_interval     = max(base_interval, 60)   # 强制最小 60 秒
 
 # ========== 轮询循环（在【当前对话】内同步执行；禁止后台化） ==========
 while poll_idx < config.max_polls:
@@ -248,7 +264,7 @@ while poll_idx < config.max_polls:
                     match_key = m.get("home", "") + "|" + m.get("away", ""),
                     schema    = "see §parse_search_result event schema (id_hash + ts + team + type + text)",
                 )
-                cap_b      = 2 * config["max_events_per_msg"]    # 过取 2× 防丢，默认 12
+                cap_b      = (3 if config.get("commentary_style", "events_only") == "play_by_play" else 2) * config["max_events_per_msg"]    # play_by_play: 3× 防丢(默认24); events_only: 2×(默认12)
                 m["events"] = raw_events[-cap_b:]
             except Exception:
                 m["events"] = []                          # graceful=[]，绝不 raise
@@ -277,11 +293,23 @@ while poll_idx < config.max_polls:
     score_changed  = (last_pushed_score is None) or (not scores_equal(score_snapshot, last_pushed_score))
     has_new_events = len(all_events_this_cycle) > 0
 
-    # 2b. push gate —— USER DECISION (R1, binding):「有新事件也触发 push」
-    #      score 未变 + 无新事件 → skip 整轮（不推送、不更新 state）
-    #      其它三种组合 → 推送（具体分支见 §render_live 2x2 状态表）
-    if not score_changed and not has_new_events:
-        log("no score change and no new events — skip push")
+    # 2b. push gate —— commentary_style determines skip behavior:
+    #
+    #   commentary_style == "events_only" (original behavior):
+    #     score 未变 + 无新事件 → skip 整轮
+    #     其它三种组合 → 推送
+    #
+    #   commentary_style == "play_by_play" (文字直播):
+    #     NEVER skip — always push. Even when score unchanged and no new events,
+    #     the current score/phase itself is the update (the user chose play_by_play
+    #     precisely because they want continuous updates).
+    #     Exception: if Stage B completely failed AND score unchanged → still push
+    #     (score+phase is still useful info in play_by_play mode).
+    should_skip = (not score_changed and not has_new_events
+                   and config.get("commentary_style", "events_only") == "events_only")
+
+    if should_skip:
+        log("no score change and no new events (events_only mode) — skip push")
         # 不进入 PERSIST，不调用 sign_and_post，直接跳到 SLEEP
         # （is_finished 检查仍在第 5 步执行，比赛刚好在「无变化无事件」轮结束的极小概率场景下，
         #  下一轮 fresh 重新分类即可触达 is_finished 分支。）
@@ -301,7 +329,7 @@ while poll_idx < config.max_polls:
         m["new_events"] = m["new_events"][-cap_msg:]      # 只保留最新 cap_msg 条
 
     # 2d. 渲染 —— render_live 内部会按 2x2 状态表选 body 前缀（见 §render_live）
-    msg = render_live(fresh, last_pushed_score, score_snapshot)
+    msg = render_live(fresh, last_pushed_score, score_snapshot, config)
 
     # 2e. 防御式 SKIP 检查 —— 理论上 2b 已经过滤过；这里防止 render_live 内部判定哨兵漏网
     if msg == "SKIP":
@@ -457,7 +485,7 @@ else:
       "id_hash": "<sha1((match_key + '|' + ts + '|' + text).encode('utf-8'))[:12]>",  # 去重键，REQUIRED；算法见下方（必须 byte-equal Stage B）
       "ts":      "21'" | "Q3 4:32" | "HT" | "",         # 比赛时钟字符串，REQUIRED（可为 ""）
       "team":    "home" | "away" | "",                  # 归属队；中性事件留 ""
-      "type":    "goal" | "foul" | "sub" | "card" | "key_play" | "other",   # 6 个枚举（与 §llm_extract_events VALID_TYPES byte-equal）
+      "type":    "goal" | "foul" | "sub" | "card" | "key_play" | "other" | "shot" | "save" | "corner" | "free_kick" | "timeout" | "turnover" | "rebound" | "commentary",   # 14 个枚举；后 8 个仅 commentary_style="play_by_play" 时使用（与 §llm_extract_events VALID_TYPES byte-equal）
       "text":    "≤80 个中文字符的单行描述"
     }
   ]
@@ -470,9 +498,17 @@ else:
 - `events` 仅承载「本轮搜索结果中能直接读出来的事件」，`parse_search_result` 不主动发起额外请求去补全事件（拉取逻辑属于其他子函数的职责）。
 - 字段语义：
   - `id_hash`：长度恰好 12 的十六进制字符串，跨轮去重的唯一键，必填。
-  - `ts`：游戏内时钟字符串，**保留原始风格**——足球用 `"21'"` / `"45+2'"` / `"HT"`；篮球用 `"Q3 4:32"` / `"OT 1:05"`；无法获取时填 `""`。必填字段，但允许 `""`。
+  - `ts`：游戏内时钟字符串，**保留原始风格**——足球用 `"21'"` / `"45+2'"` / `"HT"`；篮球用 `"Q3 4:32"` / `"OT 1:05"`；无法获取时填 `""`。必填字段，但允许 `""`。`commentary` 类型事件**允许 `ts` 为 `""`**（叙述性事件不总是有精确时钟，此时 `id_hash` 仍由 `match_key + "|" + "" + "|" + text` 计算）。
   - `team`：`"home"` / `"away"` 之一；裁判/中立事件填 `""`。
-  - `type`：枚举值之一；不在枚举内的杂项一律归到 `"other"`，不要新造字符串。
+  - `type`：枚举值之一；不在枚举内的杂项一律归到 `"other"`，不要新造字符串。当 `commentary_style == "events_only"` 时仅使用前 6 个类型（goal/foul/sub/card/key_play/other）；当 `commentary_style == "play_by_play"` 时可使用全部 14 个类型。各扩展类型含义：
+    - `shot`：射门 / 投篮未中（球权未转化为得分）
+    - `save`：扑救 / 封盖（守门员扑出 / 篮球盖帽）
+    - `corner`：角球
+    - `free_kick`：任意球 / 罚球（未得分的那种）
+    - `timeout`：暂停（篮球暂停 / 足球医疗暂停等）
+    - `turnover`：失误 / 丢球权（传球失误、被抢断等）
+    - `rebound`：篮板球
+    - `commentary`：文字解说叙述行——当无具体技术事件但需描述比赛节奏/局势时使用（如「双方中场争夺激烈，均无威胁进攻」）。这是 `play_by_play` 模式的**兜底类型**，保证每轮至少有一条输出。
   - `text`：单行中文描述，长度 ≤ 80 个字符（按字符数算，不是字节数）；不要含换行/Markdown。
 
 **`id_hash` 计算规则（必须严格按此实现，4 家 Agent 一致）**：
@@ -612,7 +648,7 @@ for match in matches:
     # 2c. 只保留最新的 2 × max_events_per_msg 条（默认 max_events_per_msg=6 → 取 12 条）
     #     超额抓取是为了给后续 commit 的去重逻辑（seen_event_ids 过滤）留缓冲，
     #     避免过滤完直接空掉。
-    cap_b = 2 * config["max_events_per_msg"]   # 默认 12
+    cap_b = (3 if config.get("commentary_style", "events_only") == "play_by_play" else 2) * config["max_events_per_msg"]   # play_by_play: 3×=24; events_only: 2×=12
     match["events"] = raw_events[-cap_b:]      # 取末尾 cap_b 条（最新）
 
     # 2d. id_hash 计算严格复用 §parse_search_result 已规定的算法（byte-equal）：
@@ -726,7 +762,7 @@ def url_path(url):
   "id_hash": "12-char hex",       // sha1((match_key + "|" + ts + "|" + text).encode("utf-8"))[:12]
   "ts":      "MM:SS or P-MM:SS",  // 比赛内时钟 (e.g. "Q3-08:32" / "45+2'" / "10:24")
   "team":    "home|away|null",    // 事件归属，无法判定时填 null
-  "type":    "goal|foul|sub|card|key_play|other",   // 6 个枚举值之一
+  "type":    "goal|foul|sub|card|key_play|other|shot|save|corner|free_kick|timeout|turnover|rebound|commentary",   // 枚举值之一（后 8 个仅 play_by_play 模式）
   "text":    "string"             // 一行人类可读描述 (≤ 80 字符)
 }
 ```
@@ -745,13 +781,17 @@ def llm_extract_events(page_md, match_key, schema):
     参数 `schema` 是字符串文档锚点（用于审计 trace），原文会被注入 prompt 的
     "== schema 参考 ==" 段落里。它**不**改变下方 5 字段定义——5 字段定义是这份
     prompt 的字面真理源，调用方传进来的 schema 串只是给 LLM 一个交叉引用的提示。
+
+    （隐式依赖 `config.commentary_style`：决定使用 events_only prompt 还是 play_by_play prompt。
+    commentary_style 来自主循环 §read_config 启动时读取——llm_extract_events 不自行读配置。）
     """
     # 1. 输入大小防御：超过 60KB 截断（防止 prompt 爆 LLM 上下文）
     if len(page_md) > 60_000:
         page_md = page_md[-60_000:]   # 取末尾，因为最新事件通常在页面底部
 
-    # 2. 字面 prompt（HARD CONTRACT，4 家 Agent 不许改字符）
-    prompt = """你是一个体育赛事文字直播解析器。下面是一段 markdown 格式的比赛文字直播页面。
+    # === events_only prompt (commentary_style == "events_only") ===
+    # This is the ORIGINAL prompt, unchanged. Only used when commentary_style == "events_only".
+    prompt_events_only = """你是一个体育赛事文字直播解析器。下面是一段 markdown 格式的比赛文字直播页面。
 
 请按时间倒序扫描，抽取最近发生的所有事件，每条事件必须包含 5 个字段：
 
@@ -780,7 +820,59 @@ def llm_extract_events(page_md, match_key, schema):
 
 == 文字直播页面（markdown） ==
 %PAGE_MD%
-""".replace("%SCHEMA%", str(schema or "")).replace("%MATCH_KEY%", match_key).replace("%PAGE_MD%", page_md)
+"""
+
+    # === play_by_play prompt (commentary_style == "play_by_play") ===
+    # HARD CONTRACT: 4 家 Agent 不许改字符（与 events_only prompt 同等约束）
+    prompt_play_by_play = """你是一个体育赛事文字直播解说员。下面是一段 markdown 格式的比赛文字直播页面。
+
+请按时间倒序扫描，提取**所有**最近发生的比赛进程——不仅仅是进球/犯规等重大事件，还包括射门、扑救、角球、暂停、失误等常规动作，以及比赛节奏/局势的叙述。每条事件必须包含 5 个字段：
+
+- ts:   比赛内时钟字符串。NBA 用 "Q1-11:45" / "Q4-02:13" / "OT-04:00"；足球用 "12'" / "45+2'" / "67'"；其他用页面原始时钟字符串。
+- team: 事件归属方。明确属于主队填 "home"，客队填 "away"，无法判定填 null。**不要瞎猜**——宁可填 null。
+- type: 必须是以下 14 个枚举值之一：
+        - goal      (进球 / 得分 / 投篮命中 / 三分球 / 点球命中)
+        - foul      (犯规 / 违例)
+        - sub       (换人)
+        - card      (黄牌 / 红牌)
+        - key_play  (关键回合 / 绝杀 / 扑点)
+        - shot      (射门 / 投篮未中——球权未转化为得分)
+        - save      (扑救 / 盖帽——守门员扑出或篮球封盖)
+        - corner    (角球)
+        - free_kick (任意球 / 罚球未中)
+        - timeout   (暂停)
+        - turnover  (失误 / 丢球权 / 被抢断)
+        - rebound   (篮板球)
+        - commentary (文字解说叙述行——用于描述比赛节奏/局势/无具体技术事件时的状况)
+        - other     (其他不便归类的)
+- text: 一行人类可读描述，必须 ≤ 80 个字符。中文优先。风格要求：**像文字解说员一样叙述**，例：「詹姆斯突破上篮被戴维斯封盖」「中场争夺激烈，双方均无威胁进攻」。不要只写冰冷的技术统计——要有画面感。
+- id_hash: 留空字符串 ""，由调用方计算填入，**LLM 不要算**。
+
+⚠ 重要：如果页面中近期无任何具体技术事件（无射门/犯规/换人等），你**必须**至少输出 1 条 type="commentary" 的事件来描述当前比赛状态，例：「比赛进行到第65分钟，双方中场争夺，均无威胁进攻」或「第二节中段，双方陷入拉锯战」。**绝不**输出空数组 `[]`——除非页面是空壳或比赛未开始。
+
+输出格式：严格的 JSON 数组，不许有任何 markdown 围栏（不要 ```json）、不许有解释文字。
+顺序：按页面里的事件出现顺序（通常是时间倒序，最新在前）。
+数量：最多输出 40 条，超过的略掉。
+页面是空壳 / 解析失败 → 输出 `[]`（空数组）。
+
+== schema 参考 ==
+%SCHEMA%
+
+== 比赛标识 ==
+%MATCH_KEY%
+
+== 文字直播页面（markdown） ==
+%PAGE_MD%
+"""
+
+    # 2c. Prompt selection based on commentary_style
+    if config.get("commentary_style", "events_only") == "play_by_play":
+        prompt = prompt_play_by_play
+    else:
+        prompt = prompt_events_only
+
+    # Apply variable substitution
+    prompt = prompt.replace("%SCHEMA%", str(schema or "")).replace("%MATCH_KEY%", match_key).replace("%PAGE_MD%", page_md)
 
     # 3. 让宿主 Agent 自己 reason（IMPORTANT：这不是个真函数——
     #    `host_agent_self_reason()` 只是伪代码占位符，表示「把上面的 prompt 当作
@@ -816,9 +908,20 @@ def llm_extract_events(page_md, match_key, schema):
         return []
 
     # 5. 逐条校验 + 计算 id_hash + 强行修剪
-    VALID_TYPES = {"goal", "foul", "sub", "card", "key_play", "other"}
+    # 5a. VALID_TYPES selection based on commentary_style
+    VALID_TYPES_EVENTS_ONLY = {"goal", "foul", "sub", "card", "key_play", "other"}
+    VALID_TYPES_PLAY_BY_PLAY = {"goal", "foul", "sub", "card", "key_play", "other",
+                                "shot", "save", "corner", "free_kick",
+                                "timeout", "turnover", "rebound", "commentary"}
+    # IMPORTANT: commentary_style comes from config read at startup (§read_config).
+    # llm_extract_events reads config.commentary_style directly to select VALID_TYPES,
+    # hard_cap, and commentary fallback behavior. config is assumed to be in scope
+    # (module-level or closure variable, same convention as other pseudocode functions).
+    valid_types = VALID_TYPES_PLAY_BY_PLAY if config.get("commentary_style", "events_only") == "play_by_play" else VALID_TYPES_EVENTS_ONLY
+
+    hard_cap = 40 if config.get("commentary_style", "events_only") == "play_by_play" else 30   # play_by_play produces more entries
     cleaned = []
-    for ev in events[:30]:                       # 硬上限 30 条
+    for ev in events[:hard_cap]:
         if not isinstance(ev, dict):
             continue
         ts   = str(ev.get("ts",   "")).strip()
@@ -826,11 +929,14 @@ def llm_extract_events(page_md, match_key, schema):
         if team not in ("home", "away", None):
             team = None
         ev_type = str(ev.get("type", "other")).strip().lower()
-        if ev_type not in VALID_TYPES:
+        if ev_type not in valid_types:
             ev_type = "other"
         text = str(ev.get("text", "")).strip()[:80]   # 80 字符硬截断
 
-        if not ts or not text:                   # ts 或 text 为空 → 丢弃
+        if not text:                             # text 为空 → 丢弃
+            continue
+        # commentary 类型允许 ts 为空（叙述性事件不总是有精确时钟）
+        if not ts and ev_type != "commentary":
             continue
 
         # id_hash 算法 = §parse_search_result 已规定，4 家 Agent byte-equal
@@ -842,6 +948,20 @@ def llm_extract_events(page_md, match_key, schema):
             "team":    team,
             "type":    ev_type,
             "text":    text,
+        })
+
+    # 6. play_by_play commentary fallback：保证文字直播模式每轮至少有 1 条叙述
+    #    若 LLM 未产出任何事件（返回空数组或全部被校验丢弃），注入一条合成 commentary。
+    #    这是「文字直播每轮必推」承诺的兜底——纯靠 prompt 指令不够（LLM 可能不遵守）。
+    if config.get("commentary_style", "events_only") == "play_by_play" and len(cleaned) == 0:
+        fallback_text = "比赛进行中，暂无详细事件数据"
+        fallback_hash = sha1((match_key + "|" + "" + "|" + fallback_text).encode("utf-8")).hexdigest()[:12]
+        cleaned.append({
+            "id_hash": fallback_hash,
+            "ts":      "",
+            "team":    None,
+            "type":    "commentary",
+            "text":    fallback_text,
         })
 
     return cleaned
@@ -992,7 +1112,7 @@ result = { feishu: null, dingtalk: null }
 
 # ===== 飞书 =====
 if config.feishu.webhook_url is non-empty:
-    body = render_feishu_card(msg)        # JSON 对象
+    body = render_feishu_card(msg, config)        # JSON 对象
     if config.feishu.secret is non-empty:
         ts   = current_unix_seconds()                                 # 注意：秒级
         sign = base64(hmac_sha256(key=secret, data=ts + "\n" + secret))
@@ -1004,7 +1124,7 @@ if config.feishu.webhook_url is non-empty:
 
 # ===== 钉钉 =====
 if config.dingtalk.webhook_url is non-empty:
-    body = render_dingtalk_md(msg)
+    body = render_dingtalk_md(msg, config)
     url  = config.dingtalk.webhook_url
     if config.dingtalk.secret is non-empty:
         ts   = current_unix_milliseconds()                             # 注意：毫秒级
@@ -1032,24 +1152,30 @@ if config.dingtalk.webhook_url is non-empty and result.dingtalk != True: ok = Fa
 return ok
 ```
 
-#### `render_live(fresh, last_pushed_score, score_snapshot)` —— 去重 + events 门控
+#### `render_live(fresh, last_pushed_score, score_snapshot, config)` —— 去重 + events 门控
 
 `render_live` 在比分去重的基础上叠加「事件门控」——即使比分没变，只要本轮存在**新事件**（`fresh` 中每个 match 的 `m.new_events` 至少有一条；`new_events` 由主循环 §主流程伪代码 在调用本函数前预先计算并附到 match dict 上，见 §主循环 push gate），就**仍然推送一条「比分无变化但有新事件」的简化卡片**。
 
-##### 2×2 状态表（branch matrix）
+在 `play_by_play` 模式下，即使比分未变且无新事件，仍然推送（不 SKIP）——这正是用户选择文字直播模式的预期：持续收到更新。
 
-| 比分 (Score) | 新事件 (New Events) | 分支 | body 前缀 |
-|--------------|---------------------|------|-----------|
-| 已变化 (Changed) | 任意 (≥0) | regular push | (沿用原前缀，例如直接以 `msg.body` 起头，不加无变化前缀) |
-| 未变化 (Unchanged) | ≥1 | events-only push | `📌 比分无变化 · 📋 N 条新事件` (N = 本轮新事件总数) |
-| 未变化 (Unchanged) | 0 | **跳过 (SKIP)** | — (返回字符串字面量 `"SKIP"`，主循环检测到后 `continue` 不推送) |
+##### 3×2 状态表（branch matrix — commentary_style × score × events）
+
+| commentary_style | 比分 (Score) | 新事件 (New Events) | 分支 | body 前缀 |
+|------------------|--------------|---------------------|------|-----------|
+| events_only | Changed | 任意 (≥0) | regular push | (沿用原前缀，不加无变化前缀) |
+| events_only | Unchanged | ≥1 | events-only push | `📌 比分无变化 · 📋 N 条新事件` (N = 本轮新事件总数) |
+| events_only | Unchanged | 0 | **SKIP** | — (返回字符串字面量 `"SKIP"`) |
+| play_by_play | Changed | 任意 (≥0) | regular push | (沿用原前缀) |
+| play_by_play | Unchanged | ≥1 | commentary push | `🎤 文字直播 · 📋 N 条新动态` (N = 本轮新事件总数) |
+| play_by_play | Unchanged | 0 | **always-push** | `🎤 文字直播 · ⏱️ 比分暂无变化` |
 
 > 注：本表只覆盖「正在直播」分支下的实时推送；未开始 / 已完结由 `render_preview` / `render_final` 处理，不进本函数。
+> play_by_play 模式下**永不 SKIP**——即使比分未变且无新事件，仍推送当前比分/阶段作为"持续在线"信号。这正是用户选择文字直播模式的预期。
 
-##### 分支伪代码（4 个分支，if/else 决策树）
+##### 分支伪代码（commentary_style-aware 决策树）
 
 ```text
-def render_live(fresh, last_pushed_score, score_snapshot):
+def render_live(fresh, last_pushed_score, score_snapshot, config):
     msg = build_msg_from_fresh(fresh, kind="live")    # 见 §build_msg_from_fresh
 
     # 把每个 match.new_events（由主循环 push gate 预先填充，见 §主循环 push gate）
@@ -1066,21 +1192,27 @@ def render_live(fresh, last_pushed_score, score_snapshot):
     score_changed   = (last_pushed_score is None) or (not scores_equal(score_snapshot, last_pushed_score))
     has_new_events  = new_events_count > 0
 
-    # === Branch 1: 比分变化（无论事件多少）→ regular push ===
-    if score_changed:
-        # 不修改 msg.body 前缀；msg.events 已挂载，渲染器自决定是否展示
+    # === commentary_style-aware branching ===
+
+    if config.get("commentary_style", "events_only") == "events_only":
+        # --- Original 3-branch logic (unchanged) ---
+        if score_changed:
+            return msg
+        if has_new_events:
+            msg.body = "📌 比分无变化 · 📋 " + str(new_events_count) + " 条新事件\n" + msg.body
+            return msg
+        return "SKIP"
+
+    else:  # play_by_play
+        # --- New 3-branch logic: never SKIP ---
+        if score_changed:
+            return msg
+        if has_new_events:
+            msg.body = "🎤 文字直播 · 📋 " + str(new_events_count) + " 条新动态\n" + msg.body
+            return msg
+        # score unchanged + no new events → still push (play_by_play never skips)
+        msg.body = "🎤 文字直播 · ⏱️ 比分暂无变化\n" + msg.body
         return msg
-
-    # === Branch 2: 比分未变化 + 有新事件 → events-only push ===
-    if has_new_events:
-        msg.body = "📌 比分无变化 · 📋 " + str(new_events_count) + " 条新事件\n" + msg.body
-        return msg
-
-    # === Branch 3: 比分未变化 + 无新事件 → SKIP（哨兵）===
-    # 主循环看到 "SKIP" 字符串后必须 continue，不调用 sign_and_post
-    return "SKIP"
-
-    # === Branch 4 (隐含): score_changed 与 has_new_events 互斥分类已穷尽，无 fallthrough ===
 ```
 
 ##### `scores_equal(a, b)` 语义
@@ -1089,9 +1221,10 @@ def render_live(fresh, last_pushed_score, score_snapshot):
 
 ##### `"SKIP"` 哨兵契约
 
-- 当 `render_live` 判定「比分未变 且 无新事件」时，**必须**返回字面量字符串 `"SKIP"`（而不是返回 None / 抛异常 / 返回空 msg）。
+- 当 `render_live` 判定「比分未变 且 无新事件」且 `commentary_style == "events_only"` 时，**必须**返回字面量字符串 `"SKIP"`（而不是返回 None / 抛异常 / 返回空 msg）。
+- 当 `commentary_style == "play_by_play"` 时，**永不返回 `"SKIP"`**——即使比分未变且无新事件，仍返回 msg 对象（body 前缀加 `🎤 文字直播 · ⏱️ 比分暂无变化`）。
 - 主循环（§主流程伪代码 第 2 步 RENDER 之后）**必须**在调用 `sign_and_post` 之前显式判定 `if msg == "SKIP": continue`，跳过 PERSIST 与 POST，直接进入下一个 sleep 切片。
-- 该哨兵保证了「无变化无事件」时**不发空消息打扰群成员**，同时让 push gate 决策仍然集中在 `render_live`，而不是散落在主循环里。
+- 该哨兵保证了 `events_only` 模式下「无变化无事件」时**不发空消息打扰群成员**，同时让 push gate 决策仍然集中在 `render_live`，而不是散落在主循环里。
 
 #### `extract_score_snapshot(fresh)` —— 比分快照（去重 + 持久化用）
 
@@ -1138,17 +1271,18 @@ return msg
 
 #### `build_msg_from_fresh(data, kind)` —— 抽象消息组装器
 
-将 `parse_search_result` 已归一化的 `data`（**match dict 列表**，每个含 `home` / `away` / `score` / `phase` / `phase_keywords` / `summary` 等字段，schema 见 §parse_search_result）组装为标准 `msg` 对象（`{title, body, footer, template}`）。组装时根据 `kind`（"live" / "preview" / "final"）选模板和文案。具体内容参考 §消息格式规范 章节里的飞书/钉钉示例：
+将 `parse_search_result` 已归一化的 `data`（**match dict 列表**，每个含 `home` / `away` / `score` / `phase` / `phase_keywords` / `summary` 等字段，schema 见 §parse_search_result）组装为标准 `msg` 对象（`{title, body, footer, template}`）。组装时根据 `kind`（"live" / "preview" / "final"）选模板和文案。**隐式依赖 `config`**：`kind == "live"` 时需要 `config.commentary_style` 来选择标题（"实时播报" vs "文字直播"），以及 `poll_interval` 来计算 footer 更新间隔。`config` 通过模块级 / 闭包变量访问，与 `render_live` / `render_feishu_card` / `render_dingtalk_md` 同一约定（见 §伪代码约定）。具体内容参考 §消息格式规范 章节里的飞书/钉钉示例：
 
-| `kind` | `msg.title` 示例 | `msg.template` | `msg.footer` |
-|--------|-----------------|---------------|--------------|
-| `"live"` | `"🏀 NBA 实时播报"` / `"⚽ 世界杯 实时播报"` | `"blue"` | `"🤖 上班看球播报员 \| 下次更新: 3分钟后"` |
-| `"preview"` | `"📋 比赛前瞻"` | `"orange"` | `"🤖 上班看球播报员 \| 比赛尚未开始，敬请期待"` |
-| `"final"` | `"🏀 NBA 比赛结束"` / `"⚽ 世界杯 比赛结束"` | `"green"` | `"🤖 上班看球播报员 \| 播报结束"` |
+| `kind` | `commentary_style` | `msg.title` 示例 | `msg.template` | `msg.footer` |
+|--------|-------------------|-----------------|---------------|--------------|
+| `"live"` | events_only | `"🏀 NBA 实时播报"` / `"⚽ 世界杯 实时播报"` | `"blue"` | `"🤖 上班看球播报员 \| 下次更新: {ceil(poll_interval/60)}分钟后"` |
+| `"live"` | play_by_play | `"🏀 NBA 文字直播"` / `"⚽ 世界杯 文字直播"` | `"blue"` | `"🤖 上班看球播报员 \| 下次更新: {ceil(poll_interval/60)}分钟后"` |
+| `"preview"` | any | `"📋 比赛前瞻"` | `"orange"` | `"🤖 上班看球播报员 \| 比赛尚未开始，敬请期待"` |
+| `"final"` | any | `"🏀 NBA 比赛结束"` / `"⚽ 世界杯 比赛结束"` | `"green"` | `"🤖 上班看球播报员 \| 播报结束"` |
 
-`msg.body` 用 Markdown 编写，包含对阵双方、比分、阶段（节/半场）、关键数据。多场比赛时合并到同一个 body 内（用 `---` 分隔），避免刷屏。
+`msg.title` 选择逻辑：当 `kind == "live"` 且 `config.get("commentary_style", "events_only") == "play_by_play"` 时，标题使用「文字直播」；否则使用「实时播报」。`msg.footer` 中的更新间隔必须从实际 `poll_interval` 值动态计算（而非硬编码「3分钟」），以适应 play_by_play 模式下可能更短的轮询间隔。
 
-#### `render_feishu_card(msg)` / `render_dingtalk_md(msg)` —— 抽象消息 → 平台 JSON
+#### `render_feishu_card(msg, config)` / `render_dingtalk_md(msg, config)` —— 抽象消息 → 平台 JSON
 
 `msg` 是一个抽象消息对象，由 `render_live` / `render_preview` / `render_final` 产出，包含字段：
 
@@ -1179,10 +1313,18 @@ return msg
 | `sub` | 🔄 | 换人 |
 | `key_play` | ⭐ | 关键回合（关键三分、绝杀、扑点等） |
 | `other` | • | 其他杂项事件，使用通用项目符号 |
+| `shot` | 🎯 | 射门 / 投篮未中（play_by_play only；球权未转化为得分） |
+| `save` | 🧤 | 扑救 / 封盖（play_by_play only；守门员扑出或篮球盖帽） |
+| `corner` | 📐 | 角球（play_by_play only） |
+| `free_kick` | 🦶 | 任意球 / 罚球未中（play_by_play only） |
+| `timeout` | ⏸️ | 暂停（play_by_play only；篮球暂停 / 足球医疗暂停等） |
+| `turnover` | ❌ | 失误 / 丢球权（play_by_play only；传球失误、被抢断等） |
+| `rebound` | 🔁 | 篮板球（play_by_play only） |
+| `commentary` | 📝 | 文字解说叙述行（play_by_play only；兜底类型——当无具体技术事件时描述比赛节奏/局势） |
 
-> 实现注：`goal` 行展示时由渲染器根据 `match_type`（或 `match.home` / `match.away` 联赛上下文）二选一；其余 5 个 emoji 跨赛事一致。
+> 实现注：`goal` 行展示时由渲染器根据 `match_type`（或 `match.home` / `match.away` 联赛上下文）二选一；其余 emoji 跨赛事一致。`match_type` 是主循环启动时由用户选择（"世界杯" / "NBA"）的变量（见 §主流程伪代码 `match_type = ask_user_if_missing(...)`），不在 `parse_search_result` 输出的 match dict 中。渲染器通过与 `config` 同样的方式访问 `match_type`（模块级 / 闭包变量；`render_feishu_card(msg, config)` / `render_dingtalk_md(msg, config)` 所在作用域应能访问 `match_type`）。若无法访问 `match_type`，可通过队名上下文推断（含 "Lakers"/"Celtics" 等 NBA 队名 → 篮球 🏀；其余 → 足球 ⚽）。标注 "play_by_play only" 的 8 个类型在 `events_only` 模式下不会出现（验证阶段会映射到 `other`），渲染器不需要为 `events_only` 模式处理这些 emoji。`commentary` 类型在 `play_by_play` 模式下是**兜底类型**——当无具体技术事件时，LLM 仍会产出一行 `commentary` 描述当前比赛节奏/局势，保证每次轮询都有推送内容。
 
-**`render_feishu_card(msg)`** → 按 §飞书消息格式 组装为「N 元素」卡片（N ∈ {3, 4}）：
+**`render_feishu_card(msg, config)`** → 按 §飞书消息格式 组装为「N 元素」卡片（N ∈ {3, 4}）：
 
 ```text
 {
@@ -1199,36 +1341,58 @@ return msg
 elements = []
 elements.append({ "tag": "div", "text": { "tag": "lark_md", "content": msg.body } })  # Element 1: 比分（始终存在）
 if len(msg.events) > 0:
-    bullet = "\n".join("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"]  for e in msg.events)
-    elements.append({ "tag": "div", "text": { "tag": "lark_md",
-        "content": "📋 **实时事件**\n" + bullet
-    } })                                                                              # Element 2: 事件（CONDITIONAL）
+    if config.get("commentary_style", "events_only") == "play_by_play":
+        # play_by_play: narrative header + bullets with type-emoji
+        # Separate commentary-type events (narrative lines) from action events
+        commentary_lines = [e for e in msg.events if e.get("type") == "commentary"]
+        action_lines     = [e for e in msg.events if e.get("type") != "commentary"]
+        bullet_parts = []
+        if commentary_lines:
+            # Narrative lines go first, rendered with 📝 marker
+            for e in commentary_lines:
+                bullet_parts.append("- 📝 " + e["text"])
+        for e in action_lines:
+            bullet_parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
+        elements.append({ "tag": "div", "text": { "tag": "lark_md",
+            "content": "🎤 **文字直播**\n" + "\n".join(bullet_parts)
+        } })                                                                              # Element 2: 文字直播（play_by_play）
+    else:
+        # events_only: original format
+        bullet = "\n".join("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"]  for e in msg.events)
+        elements.append({ "tag": "div", "text": { "tag": "lark_md",
+            "content": "📋 **实时事件**\n" + bullet
+        } })                                                                              # Element 2: 事件（events_only）
 elements.append({ "tag": "hr" })                                                       # 分隔线
 elements.append({ "tag": "note", "elements": [{
     "tag": "plain_text",
-    "content": msg.footer    # e.g. "🤖 上班看球播报员 | 下次更新: 3分钟后" —— 与 §msg schema (msg.footer) byte-equal，与 §等价 JSON 模板示例一致
+    "content": msg.footer    # e.g. "🤖 上班看球播报员 | 下次更新: 1.5分钟后" —— 与 §msg schema (msg.footer) byte-equal
 }] })                                                                                  # 注脚
 
 # 等价 JSON 模板（仅 msg.events 非空时整 4 元素，msg.events 空时退化为 3 元素）：
+# events_only 模式：
 {
   "elements": [
-    // Element 1: 比分 + phase 摘要（始终存在）
     { "tag": "div", "text": { "tag": "lark_md", "content": msg.body } },
-
-    // Element 2: 实时事件列表（CONDITIONAL —— 仅当 msg.events 非空时插入）
-    // 当 len(msg.events) == 0 时整个 element 省略，卡片回退到 3 元素，向后兼容。
     { "tag": "div", "text": { "tag": "lark_md", "content":
         "📋 **实时事件**\n"
         + "\n".join("- " + e.ts + " " + emoji_for(e) + " " + e.text  for e in msg.events)
     } },
-
-      // Element 3: 分隔线（始终存在）
-      { "tag": "hr" },
-
-      // Element 4: 页脚 note（始终存在）
-      { "tag": "note", "elements": [{ "tag": "plain_text", "content": msg.footer }] }
-    ]
-  }
+    { "tag": "hr" },
+    { "tag": "note", "elements": [{ "tag": "plain_text", "content": msg.footer }] }
+  ]
+}
+# play_by_play 模式：
+{
+  "elements": [
+    { "tag": "div", "text": { "tag": "lark_md", "content": msg.body } },
+    { "tag": "div", "text": { "tag": "lark_md", "content":
+        "🎤 **文字直播**\n"
+        + (narrative_lines: "- 📝 " + e.text for commentary-type events)
+        + (action_lines: "- " + e.ts + " " + emoji_for(e) + " " + e.text for non-commentary events)
+    } },
+    { "tag": "hr" },
+    { "tag": "note", "elements": [{ "tag": "plain_text", "content": msg.footer }] }
+  ]
 }
 ```
 
@@ -1243,7 +1407,7 @@ elements.append({ "tag": "note", "elements": [{
 
 如果 `secret` 非空，由 `sign_and_post` 在该 JSON 顶层追加 `timestamp` 和 `sign` 字段。
 
-**`render_dingtalk_md(msg)`** → 按 §钉钉消息格式 组装为：
+**`render_dingtalk_md(msg, config)`** → 按 §钉钉消息格式 组装为：
 
 ```text
 {
@@ -1253,12 +1417,28 @@ elements.append({ "tag": "note", "elements": [{
     "text": "## " + msg.title + "\n\n"
             + msg.body
             + (when msg.events is non-empty:
-                  "\n\n📋 **实时事件**\n"
-                  + "\n".join("- " + e.ts + " " + emoji_for(e) + " " + e.text  for e in msg.events)
+                  (config.get("commentary_style", "events_only") == "play_by_play" ?
+                      "\n\n🎤 **文字直播**\n"
+                      + commentary_first_format(msg.events)
+                    : "\n\n📋 **实时事件**\n"
+                      + "\n".join("- " + e.ts + " " + emoji_for(e) + " " + e.text  for e in msg.events))
               else: "")
             + "\n\n---\n\n> " + msg.footer
   }
 }
+```
+
+其中 `commentary_first_format(events)` 将 `commentary` 类型事件排在最前（用 📝 标记），其余事件按原格式：
+```text
+def commentary_first_format(events):
+    commentary_lines = [e for e in events if e.get("type") == "commentary"]
+    action_lines     = [e for e in events if e.get("type") != "commentary"]
+    parts = []
+    for e in commentary_lines:
+        parts.append("- 📝 " + e["text"])
+    for e in action_lines:
+        parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
+    return "\n".join(parts)
 ```
 
 拼接顺序固定为 `title → body → events 段（可选）→ 分隔线 + footer`。`emoji_for(e)` 仍然引用上方 §Event 类型 → emoji 映射 表（与飞书卡片**同一份映射，不要复制粘贴定义**）。当 `msg.events == []` 时整段事件块省略，`text` 退化为「title + body + footer」三段，与历史 markdown 输出**完全一致**。
@@ -1267,20 +1447,34 @@ elements.append({ "tag": "note", "elements": [{
 
 钉钉 markdown `text` 字段有约 ~20KB 的硬上限（实测 server 侧裁剪点不稳定，约在 19~20KB 之间），超长会被服务端拒收并返回 `errcode != 0`。`render_dingtalk_md` 在返回前**必须**做尺寸守卫：
 
+> **play_by_play 模式注意事项**：`play_by_play` 模式事件更多（推荐 `max_events_per_msg=8-12`），size guard 更容易触发，必须确保截断逻辑在两种模式下都正确运行。算法不变，只是可能需要 pop 更多条目。
+
 - **阈值**：渲染后 `len(rendered_text) <= 18000`（按 UTF-8 字节数；保守留 2KB 安全边际给签名 / URL 编码 / 钉钉服务端额外裁剪）。
 - **超额时的截断算法**（迭代丢弃**最旧**事件）：
 
   ```text
-  def render_dingtalk_md(msg):
+  def render_dingtalk_md(msg, config):
       events_local = list(msg.events)   # 工作副本，不修改 msg.events 本身
 
       def assemble(events_to_render, truncated_count):
           ev_block = ""
           if len(events_to_render) > 0:
-              ev_block = "\n\n📋 **实时事件**\n" + "\n".join(
-                  "- " + e.ts + " " + emoji_for(e) + " " + e.text
-                  for e in events_to_render
-              )
+              if config.get("commentary_style", "events_only") == "play_by_play":
+                  # play_by_play: commentary-first format with 🎤 header
+                  commentary_lines = [e for e in events_to_render if e.get("type") == "commentary"]
+                  action_lines     = [e for e in events_to_render if e.get("type") != "commentary"]
+                  parts = []
+                  for e in commentary_lines:
+                      parts.append("- 📝 " + e["text"])
+                  for e in action_lines:
+                      parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
+                  ev_block = "\n\n🎤 **文字直播**\n" + "\n".join(parts)
+              else:
+                  # events_only: original format
+                  ev_block = "\n\n📋 **实时事件**\n" + "\n".join(
+                      "- " + e.ts + " " + emoji_for(e) + " " + e.text
+                      for e in events_to_render
+                  )
           if truncated_count > 0:
               ev_block += "\n\n…(剩余 " + str(truncated_count) + " 条事件已截断 / " \
                        + str(truncated_count) + " more events truncated)"
@@ -1563,6 +1757,121 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
 
 **无签名时**: 省略 `timestamp` 和 `sign` 字段，直接发送 `msg_type` 和 `card`。
 
+**消息体示例 — 文字直播模式（play_by_play，4 元素布局）**:
+
+当 `commentary_style="play_by_play"` 时，飞书卡片结构与 events_only 相同（4 元素），但：
+- Element 2 标题改为 `🎤 **文字直播**`（而非 `📋 **实时事件**`）
+- `commentary` 类型事件排在最前，用 📝 标记，不显示时钟前缀
+- 其余事件仍按 `ts + emoji + text` 格式
+
+```json
+{
+  "timestamp": "1700005400",
+  "sign": "zzzzzzzzzzzzz",
+  "msg_type": "interactive",
+  "card": {
+    "header": {
+      "title": { "tag": "plain_text", "content": "⚽ 世界杯 文字直播" },
+      "template": "blue"
+    },
+    "elements": [
+      {
+        "tag": "div",
+        "text": {
+          "tag": "lark_md",
+          "content": "**阿根廷 vs 法国**\n🕐 下半场 73'\n\n📊 **当前比分**: 阿根廷 2 - 1 法国"
+        }
+      },
+      {
+        "tag": "div",
+        "text": {
+          "tag": "lark_md",
+          "content": "🎤 **文字直播**\n- 📝 双方中场争夺激烈，法国控球率略占优势\n- 71' ⚽ 梅西禁区右肋抽射破门，阿根廷再下一城\n- 68' 🔄 法国换人：吉鲁下，科洛·穆阿尼上\n- 65' 🎯 姆巴佩远射偏出\n- 64' 🟨 德保罗战术犯规\n- 59' 🧤 大马丁扑出姆巴佩单刀\n- 57' 📐 法国获得右侧角球"
+        }
+      },
+      { "tag": "hr" },
+      {
+        "tag": "note",
+        "elements": [
+          { "tag": "plain_text", "content": "🤖 上班看球播报员 | 下次更新: 1.5分钟后" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**比分未变、有 commentary 事件时的文字直播推送**:
+
+```json
+{
+  "msg_type": "interactive",
+  "card": {
+    "header": {
+      "title": { "tag": "plain_text", "content": "⚽ 世界杯 文字直播" },
+      "template": "blue"
+    },
+    "elements": [
+      {
+        "tag": "div",
+        "text": {
+          "tag": "lark_md",
+          "content": "🎤 文字直播 · 📋 1 条新动态\n\n**阿根廷 vs 法国**\n🕐 下半场 80'\n\n📊 **当前比分**: 阿根廷 2 - 1 法国"
+        }
+      },
+      {
+        "tag": "div",
+        "text": {
+          "tag": "lark_md",
+          "content": "🎤 **文字直播**\n- 📝 比赛进入最后十分钟，阿根廷收缩防守，法国持续施压但暂无威胁射门"
+        }
+      },
+      { "tag": "hr" },
+      {
+        "tag": "note",
+        "elements": [
+          { "tag": "plain_text", "content": "🤖 上班看球播报员 | 下次更新: 1.5分钟后" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**比分未变、无新事件时的文字直播推送**（3 元素布局——事件 div 省略）:
+
+当 `commentary_style="play_by_play"` 且本轮无新事件（LLM 也未返回任何事件）时，飞书卡片退化为 3 元素（比分 div + hr + note），body 前缀为 `🎤 文字直播 · ⏱️ 比分暂无变化`。
+
+```json
+{
+  "msg_type": "interactive",
+  "card": {
+    "header": {
+      "title": { "tag": "plain_text", "content": "⚽ 世界杯 文字直播" },
+      "template": "blue"
+    },
+    "elements": [
+      {
+        "tag": "div",
+        "text": {
+          "tag": "lark_md",
+          "content": "🎤 文字直播 · ⏱️ 比分暂无变化\n\n**阿根廷 vs 法国**\n🕐 下半场 85'\n\n📊 **当前比分**: 阿根廷 2 - 1 法国"
+        }
+      },
+      { "tag": "hr" },
+      {
+        "tag": "note",
+        "elements": [
+          { "tag": "plain_text", "content": "🤖 上班看球播报员 | 下次更新: 1.5分钟后" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+> 注意：此场景下 `msg.events == []`，事件 div 被省略，与 `events_only` 模式的 3 元素退化布局一致（见 §编排规则第 1 条）。
+
 ### 钉钉消息格式
 
 钉钉自定义机器人支持 Markdown 格式消息。
@@ -1613,7 +1922,21 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
 }
 ```
 
-> 当 `msg.events == []` 时，整段「📋 **实时事件**」省略，`text` 退化为「title + body + footer」三段，与上方第一个示例的结构一致。渲染前还要走 §钉钉 18000 字节 size guard：超过 18000 字节按 FIFO 丢队首事件，必要时附「已截断 N 条」标记。
+> 当 `msg.events == []` 时，整段「📋 **实时事件**」或「🎤 **文字直播**」省略，`text` 退化为「title + body + footer」三段，与上方第一个示例的结构一致。渲染前还要走 §钉钉 18000 字节 size guard：超过 18000 字节按 FIFO 丢队首事件，必要时附「已截断 N 条」标记。
+
+**消息体示例 — 文字直播模式（play_by_play）**:
+
+当 `commentary_style="play_by_play"` 时，钉钉 markdown 格式与 events_only 类似，但事件段标题改为 `🎤 **文字直播**`，且 `commentary` 类型事件用 📝 标记排在前面。
+
+```json
+{
+  "msgtype": "markdown",
+  "markdown": {
+    "title": "⚽ 世界杯 文字直播",
+    "text": "## ⚽ 世界杯 文字直播\n\n🎤 文字直播 · 📋 7 条新动态\n\n**阿根廷 vs 法国**\n\n- 🕐 下半场 73'\n\n---\n\n### 📊 当前比分\n\n**阿根廷 2 - 1 法国**\n\n---\n\n🎤 **文字直播**\n\n- 📝 双方中场争夺激烈，法国控球率略占优势\n- 71' ⚽ 梅西禁区右肋抽射破门，阿根廷再下一城\n- 68' 🔄 法国换人：吉鲁下，科洛·穆阿尼上\n- 65' 🎯 姆巴佩远射偏出\n- 64' 🟨 德保罗战术犯规\n- 59' 🧤 大马丁扑出姆巴佩单刀\n- 57' 📐 法国获得右侧角球\n\n---\n\n> 🤖 上班看球播报员 | 下次更新: 1.5分钟后"
+  }
+}
+```
 
 ---
 
@@ -1624,13 +1947,15 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
 | 1 | **每次执行前先 read config.json** | 获取 webhook 地址 / 轮询间隔 / 失败上限 |
 | 2 | **搜索优先用 LLM web_search** | 不要依赖固定 API、不要假设 API Key |
 | 3 | **三态分流** | 已完结 → 一次性总结；未开始 → 一次性前瞻；正在直播 → 进入轮询 |
-| 4 | **比分无变化也要发** | 在 markdown / 卡片中加注「比分无变化」让群里知道播报仍在运行 |
+| 4 | **比分无变化时的推送策略** | `events_only`：比分无变化但有新事件时推送（加注「比分无变化」）；无新事件则跳过。`play_by_play`：每轮必推，即使比分未变也有叙述更新。 |
 | 5 | **错误重试 + 上限** | 单步失败立即重试一次；连续 `max_consecutive_failures` 次彻底失败则停止并通知用户 |
 | 6 | **优雅终止** | 用户说「停止 / 结束 / stop」时，Agent 在**当前 sleep 切片结束、控制权回到自己后**立刻发送最终赛果并退出（**不进入下一个切片或下一轮 sleep**）。首次启动时必须告知用户：发停止后最长等待一个 sleep 切片（约 60 秒）才会真正退出 —— 这是前台 sleep 切片的物理限制，详见 §优雅终止 + §chunked sleep。 |
 | 7 | **多场比赛汇总** | 同一时间多场比赛**合并到一条消息**里发送，避免刷屏 |
 | 8 | **必须前台 sleep** | `Start-Sleep -Seconds N`（PowerShell）或 `sleep N`（Unix），**禁止任何形式的后台化** |
 | 9 | **不创建调度脚本** | 不要 `write` 任何 `.py` / `.sh` / `.ps1` 来跑循环；循环必须由 Agent 自身在对话里跑 |
 | 10 | **语言** | 所有播报内容使用 `config.language`（默认 zh-CN） |
+| 11 | **commentary_style 决定推送频率** | `events_only` = 仅在比分变化或出现新事件时推送；`play_by_play` = 每轮必推，即使比分未变。用户选择文字直播模式时期望的就是持续更新。 |
+| 12 | **play_by_play 的 commentary 兜底** | `play_by_play` 模式下，如果本轮无具体技术事件，LLM **必须**产至少 1 条 `type="commentary"` 事件描述当前局势。这保证每轮推送都有内容，不会发空消息。 |
 
 ---
 
@@ -1690,12 +2015,22 @@ A: webfetch 在 60s 切片预算内超时 → `events=[]` 优雅跳过当前 mat
 
 **Q3: 比分没变，事件去重后也是空，要发吗？**
 
-A: score 不变 AND 去重后 new_events 为空 → no push (BOTH conditions required to skip; either alone still triggers a push — see R1 decision)。换句话说：
+A: 取决于 `commentary_style`：
 
 - 比分变了 → 必须推（即使没新事件）
 - 比分没变但有新事件 → 必须推（事件本身是新信息）
-- **比分没变 AND 没有任何新事件**（这两个条件**同时成立**）→ 跳过本轮推送，避免刷屏
+- **比分没变 AND 没有任何新事件** → 取决于 commentary_style：
+  - `events_only` → 跳过本轮推送，避免刷屏
+  - `play_by_play` → **仍然推送**（文字直播模式每轮必推，见 Q4）
 
-这是 R1 决策矩阵里的唯一 skip 分支。任一条件不满足都会触发推送。判断逻辑见 §主循环决策点 R1。
+这是 `events_only` 模式下的唯一 skip 分支。`play_by_play` 模式无 skip 分支。判断逻辑见 §主循环 push gate 与 §render_live 3×2 状态表。
+
+**Q4: play_by_play 模式下比分没变也没新事件，为什么要发？**
+
+A: 这是 play_by_play 模式的设计意图。用户选择文字直播，就是想要像文字解说员一样持续收到更新——即使没有进球/犯规，"比赛进行到第80分钟，双方僵持"本身就是有价值的信息。如果不想持续推送，请使用 `commentary_style: "events_only"`。
+
+**Q5: play_by_play 模式会不会刷屏太频繁？**
+
+A: 有三层控制：(1) `poll_interval_seconds` 在 play_by_play 模式下自动从 180s 降为 90s（可通过 `play_by_play_default_poll_interval_seconds` 配置或手动设 `poll_interval_seconds` 自定义）；(2) `max_events_per_msg` 控制每条消息的事件数上限；(3) 钉钉 18KB size guard 自动截断过长消息。如果仍然觉得太频繁，调大 `poll_interval_seconds` 或切回 `events_only` 模式即可。
 
 ---
