@@ -9,6 +9,7 @@
 - 🔍 自动搜索正在进行的比赛
 - 📊 每 3 分钟更新一次赛况
 - 📋 不只是比分——还会推送实时事件（进球、换人、犯规、关键球、红黄牌等），让你不在场也能跟上比赛节奏
+- 🎤 文字直播模式（play_by_play）—— 像文字解说员一样持续叙述比赛进程，每轮推送都有内容
 - 📲 通过飞书/钉钉群机器人推送到你的工作群
 - 🏀 支持 NBA、⚽ 世界杯（更多赛事陆续支持中）
 
@@ -91,8 +92,12 @@ cp config.example.json config.json
 
   // === 实时事件相关（commentary）===
   "include_events": true,          // 是否在比分基础上附带实时事件（进球/换人/犯规等），默认 true；设为 false 则退化为纯比分播报
-  "max_events_per_msg": 6,         // 每次推送最多附带的事件条数（建议 4-8；钉钉 markdown 字段约 20KB 硬上限，过多易被截断）
-  "commentary_dedup_window": 30    // 事件去重环形缓冲「记多少轮」（注意是轮数，不是事件条数）。实际容量 = window × max_events_per_msg，默认 30 × 6 = 180 条 id_hash（state 文件约 9KB）
+  "max_events_per_msg": 6,         // 每次推送最多附带的事件条数（events_only 建议 4-8；play_by_play 建议 8-12；钉钉 markdown 字段约 20KB 硬上限，过多易被截断）
+  "commentary_dedup_window": 30,   // 事件去重环形缓冲「记多少轮」（注意是轮数，不是事件条数）。实际容量 = window × max_events_per_msg，默认 30 × 6 = 180 条 id_hash（state 文件约 9KB）
+
+  // === 播报风格 ===
+  "commentary_style": "events_only",       // 播报风格: "events_only" = 仅在比分变化/重大事件时推送（默认）; "play_by_play" = 文字直播模式，像解说员一样每轮推送比赛进程
+  "play_by_play_default_poll_interval_seconds": 90  // 文字直播模式推荐的轮询间隔（秒），当 poll_interval_seconds 仍为默认180时自动使用此值
 }
 ```
 
@@ -137,6 +142,9 @@ cp config.example.json config.json
 ├─ 未开始 → 发送赛事前瞻 → 结束
 └─ 正在直播
        ↓
+   ┌─ commentary_style="events_only" → 比分变化或新事件时推送
+   └─ commentary_style="play_by_play" → 每轮推送文字直播
+       ↓
    [若 include_events=true 且 Stage A 拿到 URL]
         webfetch 抓取该页 + LLM 提取最新事件（Stage B）
        ↓
@@ -165,6 +173,12 @@ A: 可以，两个都配置就会同时推送。
 
 **Q: 如何停止播报？**
 A: 在 Agent 对话中说「停止」「结束」或「stop」即可。
+
+**Q: events_only 和 play_by_play 有什么区别？**
+A: events_only（默认）只在比分变化或出现进球/犯规/换人等事件时推送。play_by_play 模式像文字解说员一样，每轮（约90秒）推送一条更新，即使没有重大事件也会描述"双方中场争夺激烈"等比赛节奏，适合想持续跟进比赛的用户。
+
+**Q: 文字直播模式推送太频繁怎么办？**
+A: 调大 `poll_interval_seconds`（如改为120或180），或切回 `commentary_style: "events_only"`。
 
 ## 文件结构
 
