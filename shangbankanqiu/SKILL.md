@@ -84,7 +84,7 @@ Start-Sleep -Seconds 180   # Windows PowerShell
 
 **当前支持的赛事**: 世界杯 (FIFA World Cup)、NBA
 
-**核心定位**: 本 Skill **不是后台服务**，而是一段让宿主 Agent 在**当前对话**里反复执行的「播报循环指令」。Agent 干完一轮就 sleep 3 分钟，醒来再干一轮，直到比赛结束或用户喊停。在该对话内 Agent 是真的阻塞的，但用户开新的对话/新窗口/新 Agent 实例依然可以正常使用 codex / cursor / opencode / claude code 做别的事——这就是「应用可以一致运行」的含义。
+**核心定位**: 本 Skill **不是后台服务**，而是一段让宿主 Agent 在**当前对话**里反复执行的「播报循环指令」。Agent 干完一轮就 sleep 2 分钟，醒来再干一轮，直到比赛结束或用户喊停。在该对话内 Agent 是真的阻塞的，但用户开新的对话/新窗口/新 Agent 实例依然可以正常使用 codex / cursor / opencode / claude code 做别的事——这就是「应用可以一致运行」的含义。
 
 ---
 
@@ -143,7 +143,7 @@ Start-Sleep -Seconds 180   # Windows PowerShell
     "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxxx",
     "secret": "你的加签密钥SEC（可选，如未启用加签则留空字符串）"
   },
-  "poll_interval_seconds": 180,
+  "poll_interval_seconds": 120,
   "max_polls": 60,
   "max_consecutive_failures": 3,
   "state_file": ".shangbankanqiu_state.json",
@@ -159,7 +159,7 @@ Start-Sleep -Seconds 180   # Windows PowerShell
 
 | 字段 | 类型 | 默认 | 范围 | 含义 |
 |------|------|------|------|------|
-| `poll_interval_seconds` | integer | 180 | ≥ 60 | 两轮之间 sleep 的秒数，建议不低于 60 |
+| `poll_interval_seconds` | integer | 120 | ≥ 60 | 两轮之间 sleep 的秒数，建议不低于 60 |
 | `max_polls` | integer | 60 | ≥ 1 | 单次 Skill 运行最多轮询多少次（防止无限循环） |
 | `max_consecutive_failures` | integer | 3 | ≥ 1 | 连续失败几次就终止 |
 | `state_file` | string | `.shangbankanqiu_state.json` | — | 跨轮去重用的临时状态文件（存上次比分），相对 skill 目录 |
@@ -211,15 +211,15 @@ last_pushed_score = persisted.get("score")              # None 表示首轮
 fail_count        = 0
 poll_idx          = 0
 # play_by_play mode recommends shorter intervals for a more "live" feel.
-# If user left poll_interval_seconds at the default 180, auto-reduce to
+# If user left poll_interval_seconds at the default 120, auto-reduce to
 # play_by_play_default_poll_interval_seconds (default 90). If user explicitly
 # set a non-default value, respect it.
-# LIMITATION: 代码无法区分「用户主动设了 180」和「默认值 180」——两者在 config 中看起来一样。
-# 如果用户确实想在 play_by_play 模式下用 180 秒间隔，需将 poll_interval_seconds 设为非 180 的值
-# （如 181 或 179），否则会被自动降为 play_by_play_default_poll_interval_seconds。
+# LIMITATION: 代码无法区分「用户主动设了 120」和「默认值 120」——两者在 config 中看起来一样。
+# 如果用户确实想在 play_by_play 模式下用 120 秒间隔，需将 poll_interval_seconds 设为非 120 的值
+# （如 121 或 119），否则会被自动降为 play_by_play_default_poll_interval_seconds。
 base_interval = config.poll_interval_seconds
-if config.get("commentary_style", "events_only") == "play_by_play" and base_interval >= 180:
-    # Only auto-reduce if user hasn't customized (180 = default from config.example.json)
+if config.get("commentary_style", "events_only") == "play_by_play" and base_interval >= 120:
+    # Only auto-reduce if user hasn't customized (120 = default from config.example.json)
     base_interval = min(base_interval, config.get("play_by_play_default_poll_interval_seconds", 90))
 poll_interval     = max(base_interval, 60)   # 强制最小 60 秒
 
@@ -259,7 +259,16 @@ while poll_idx < config.max_polls:
 
                 # ── 1. 优先使用跨轮 URL 缓存（见 §state file schema pbp_urls） ──
                 # 第二轮起直接用已发现的 URL，跳过整个 URL 发现阶段，大幅减少延迟。
+                # 但缓存有 staleness 保护：如果连续 N 轮从同一 URL 抓到 0 条新事件，
+                # 说明该 URL 可能已过期或更新太慢，自动清除缓存重新发现。
                 pbp_url = persisted.get("pbp_urls", {}).get(match_key_for_url)
+                if pbp_url is not None:
+                    empty_streak = persisted.get("pbp_url_empty_streaks", {}).get(match_key_for_url, 0)
+                    if empty_streak >= 3:                        # 连续 3 轮无新事件 → 缓存可能过期
+                        del persisted["pbp_urls"][match_key_for_url]
+                        if "pbp_url_empty_streaks" in persisted:
+                            persisted["pbp_url_empty_streaks"].pop(match_key_for_url, None)
+                        pbp_url = None                          # 强制重新发现
 
                 # ── 2. 缓存 miss → 从 Stage A snippets 嗅探 ──
                 if pbp_url is None:
@@ -291,6 +300,10 @@ while poll_idx < config.max_polls:
                     if "pbp_urls" not in persisted:
                         persisted["pbp_urls"] = {}
                     persisted["pbp_urls"][match_key_for_url] = pbp_url
+                    # 重置空轮计数器（新 URL 或 URL 仍有效）
+                    if "pbp_url_empty_streaks" not in persisted:
+                        persisted["pbp_url_empty_streaks"] = {}
+                    persisted["pbp_url_empty_streaks"][match_key_for_url] = 0
 
                 if pbp_url is None:
                     m["events"] = []
@@ -305,6 +318,14 @@ while poll_idx < config.max_polls:
                 )
                 cap_b      = (3 if config.get("commentary_style", "events_only") == "play_by_play" else 2) * config["max_events_per_msg"]    # play_by_play: 3× 防丢(默认24); events_only: 2×(默认12)
                 m["events"] = raw_events[-cap_b:]
+                # 更新 URL 缓存空轮计数器：有事件 → 重置；无事件 → 递增
+                if "pbp_url_empty_streaks" not in persisted:
+                    persisted["pbp_url_empty_streaks"] = {}
+                if len(m["events"]) > 0:
+                    persisted["pbp_url_empty_streaks"][match_key_for_url] = 0
+                else:
+                    persisted["pbp_url_empty_streaks"][match_key_for_url] = \
+                        persisted["pbp_url_empty_streaks"].get(match_key_for_url, 0) + 1
             except Exception:
                 m["events"] = []                          # graceful=[]，绝不 raise
     else:
@@ -335,8 +356,11 @@ while poll_idx < config.max_polls:
                          "上半场", "下半场", "加时", "进行中", "中场"}
             if not any(kw in phase_kws for kw in live_kws):
                 continue
-            # 仅当 Stage B 返回空事件时才合成——如果 Stage B 已抓到真实事件，不需要合成
-            if len(m.get("events", [])) > 0:
+            # 仅当 Stage B 未抓到进球事件时才合成
+            # 注意：不能用 len(m["events"]) > 0 判断——Stage B 可能返回了旧事件（缓存页面），
+            # 但其中不包含本轮新进球。必须检查 events 中是否已有 type="goal" 的事件。
+            existing_goals = [e for e in m.get("events", []) if e.get("type") == "goal"]
+            if existing_goals:
                 continue
             # 检查该场比赛比分是否变化
             match_key = m.get("home", "") + "|" + m.get("away", "")
@@ -344,14 +368,15 @@ while poll_idx < config.max_polls:
             new_score_raw = m.get("score", "")                 # e.g. "1-0" or "98-92"
             if not old_score_raw or not new_score_raw:
                 continue
-            # 解析新旧比分
+            # 解析新旧比分（处理 "98-92" / "98-92 OT" / "2-1 (PK)" 等格式）
             try:
-                old_parts = old_score_raw.replace("–", "-").replace(":", "-").split("-")
-                new_parts = new_score_raw.replace("–", "-").replace(":", "-").split("-")
-                if len(old_parts) != 2 or len(new_parts) != 2:
+                # 用正则提取数字部分，避免 split("-") 被 "OT" / "(PK)" 等后缀干扰
+                old_nums = re.findall(r'\d+', old_score_raw)
+                new_nums = re.findall(r'\d+', new_score_raw)
+                if len(old_nums) < 2 or len(new_nums) < 2:
                     continue
-                old_home, old_away = int(old_parts[0].strip()), int(old_parts[1].strip())
-                new_home, new_away = int(new_parts[0].strip()), int(new_parts[1].strip())
+                old_home, old_away = int(old_nums[0]), int(old_nums[1])
+                new_home, new_away = int(new_nums[0]), int(new_nums[1])
             except (ValueError, IndexError):
                 continue
             home_delta = new_home - old_home
@@ -359,18 +384,18 @@ while poll_idx < config.max_polls:
             # 合成进球事件
             syn_events = []
             if home_delta > 0:
-                for _ in range(home_delta):
+                for i in range(home_delta):
                     syn_events.append({
-                        "id_hash": "syn:" + sha1((match_key + "|" + new_score_raw + "|home_goal").encode("utf-8"))[:10],
+                        "id_hash": "syn:" + sha1((match_key + "|" + new_score_raw + "|home_goal|" + str(i)).encode("utf-8"))[:10],
                         "ts":      "",
                         "team":    "home",
                         "type":    "goal",
                         "text":    m.get("home", "") + " 进球！比分 " + new_score_raw,
                     })
             if away_delta > 0:
-                for _ in range(away_delta):
+                for i in range(away_delta):
                     syn_events.append({
-                        "id_hash": "syn:" + sha1((match_key + "|" + new_score_raw + "|away_goal").encode("utf-8"))[:10],
+                        "id_hash": "syn:" + sha1((match_key + "|" + new_score_raw + "|away_goal|" + str(i)).encode("utf-8"))[:10],
                         "ts":      "",
                         "team":    "away",
                         "type":    "goal",
@@ -592,23 +617,24 @@ def build_query(match_type, follow):
 
 ```text
 def build_pbp_search_query(match_type, home, away):
-    """返回 Stage A+ 的 site: 限定搜索查询。
-    策略：用 site: 限定直接搜索中文实时源的 playbyplay 页面，
-    而非依赖通用搜索偶然返回这些页面。"""
+    """返回 Stage A+ 的搜索查询。
+    策略：优先用 site: 限定（Google/Bing 支持），同时附加无 site: 的纯中文关键词
+    作为兜底（Exa/语义搜索引擎兼容）。Agent 将整条查询字符串传给 web_search，
+    由搜索引擎自行解释——不支持 site: 的引擎会忽略该词但仍匹配中文关键词。"""
     if match_type == "NBA":
         # 虎扑是中文 NBA 文字直播首选源（更新延迟 ~30s）
-        # 例: "site:nba.hupu.com/games 湖人 勇士 文字直播"
+        # 例: "site:nba.hupu.com/games 湖人 勇士 文字直播 nba.hupu.com"
         team_part = ""
         if home and away:
             team_part = " " + home + " " + away
-        return "site:nba.hupu.com/games" + team_part + " 文字直播"
+        return "site:nba.hupu.com/games" + team_part + " 文字直播 nba.hupu.com"
     elif match_type == "世界杯":
         # 新浪是中文足球直播首选源（ESPN 英文源延迟更大）
-        # 例: "site:match.sports.sina.com.cn 巴西 德国 直播"
+        # 例: "site:match.sports.sina.com.cn 巴西 德国 直播 match.sports.sina.com.cn"
         team_part = ""
         if home and away:
             team_part = " " + home + " " + away
-        return "site:match.sports.sina.com.cn" + team_part + " 直播"
+        return "site:match.sports.sina.com.cn" + team_part + " 直播 match.sports.sina.com.cn"
     else:
         # 未知赛事类型：通用中文搜索
         team_part = ""
@@ -616,6 +642,8 @@ def build_pbp_search_query(match_type, home, away):
             team_part = " " + home + " " + away
         return match_type + team_part + " 文字直播 play-by-play"
 ```
+
+> **site: 兼容性说明**：`site:` 是 Google/Bing 支持的语法，Exa 等语义搜索引擎可能忽略它。因此每条查询同时附加了裸域名（如 `nba.hupu.com`）作为兜底——不支持 `site:` 的引擎仍能通过域名关键词匹配到目标页面。
 
 > **为什么不直接在 `build_query` 里加 site: 限定**：`build_query` 同时承担比分搜索和 URL 嗅探双重职责。加 site: 限定会大幅缩小搜索范围，导致比分/状态信息不全（例如 `site:nba.hupu.com` 只返回虎扑页面，拿不到 ESPN scoreboard 的比分）。Stage A+ 将这两个职责解耦——主搜索负责全面覆盖，fallback 负责精准定位实时源。
 
@@ -1509,7 +1537,7 @@ return msg
 |------|------|------|
 | `msg.title` | string | 卡片标题文本，如 "🏀 NBA 实时播报" |
 | `msg.body` | string | 卡片正文（Markdown 或纯文本）。承载比分 + 节次/阶段摘要，**语义不变**——是字符串形式的「比分快照 + phase」概览。 |
-| `msg.footer` | string | 页脚文本，如 "🤖 上班看球播报员 \| 下次更新: 3分钟后" |
+| `msg.footer` | string | 页脚文本，如 "🤖 上班看球播报员 \| 下次更新: 2分钟后" |
 | `msg.template` | string | 飞书卡片 header 颜色：`blue`（直播中）/ `green`（已结束）/ `orange`（前瞻） |
 | `msg.events` | array&lt;event-item&gt; | **本轮要展示的新事件列表**，与 `msg.body` **平级 (PARALLEL)** 而非嵌套——`body` 仍是比分+phase 摘要字符串，`events` 是结构化事件数组。每个 event-item 的 shape 与 §parse_search_result 中 `events` 字段定义的 event-item **完全一致**（`id_hash` / `ts` / `team` / `type` / `text`，schema 单一真理见 §parse_search_result）。**MAY be `[]`**（空列表）——例如 `kind="preview"` / `"final"` 不带事件，或本轮 dedup 后无新事件且比分变化触发推送时。两个平台渲染器（`render_feishu_card` 与 `render_dingtalk_md`）都消费此字段。 |
 
@@ -1732,9 +1760,9 @@ def commentary_first_format(events):
 
 实际行为：
 
-1. **首次启动**: Agent 必须给用户发一句提示——「您可以随时发送『停止 / 结束 / stop』终止播报。由于本 Skill 用前台 sleep 等待 3 分钟（内部按 60 秒切片），您发送停止后**最长等待一个 sleep 切片（约 60 秒）**才会真正退出，这是设计如此。」
+1. **首次启动**: Agent 必须给用户发一句提示——「您可以随时发送『停止 / 结束 / stop』终止播报。由于本 Skill 用前台 sleep 等待 2 分钟（内部按 60 秒切片），您发送停止后**最长等待一个 sleep 切片（约 60 秒）**才会真正退出，这是设计如此。」
 2. **每轮 SLEEP 之前** Agent 检查一次最新对话历史里是否含「停止 / 结束 / stop」字样
-3. **每个 60 秒 sleep 切片之间** Agent 也再检查一次（见 §chunked sleep），从而把停止响应延迟从 180 秒压到 ≤60 秒
+3. **每个 60 秒 sleep 切片之间** Agent 也再检查一次（见 §chunked sleep），从而把停止响应延迟从 120 秒压到 ≤60 秒
 4. **如果发现** → 立即发送最终赛果并退出，**不进入下一个切片或下一轮 sleep**
 5. **如果当前已经在 sleep 切片中** → 用户的「停止」要等当前切片自然结束、控制权回到 Agent 之后才会被读到，这是预期行为
 
@@ -1742,14 +1770,14 @@ def commentary_first_format(events):
 
 `sleep_in_foreground(N)` 是所有 4 家 Agent 必须支持的同步阻塞调用。**禁止**用任何异步定时器实现。Agent 应该按以下顺序选择：
 
-> ⚠ **重要：下表只列出底层 sleep 命令本身（按 60 秒切片，单次调用一段）。3 分钟（180s）= 调用 3 次 60 秒。绝不直接用 `Start-Sleep -Seconds 180` / `sleep 180` 单次跑满 3 分钟（会超过 shell 工具默认 timeout 触发杀进程）。详见下方 §宿主 shell 工具 timeout 兜底（chunked sleep）。**
+> ⚠ **重要：下表只列出底层 sleep 命令本身（按 60 秒切片，单次调用一段）。2 分钟（120s）= 调用 2 次 60 秒。绝不直接用 `Start-Sleep -Seconds 120` / `sleep 120` 单次跑满 2 分钟（会超过 shell 工具默认 timeout 触发杀进程）。详见下方 §宿主 shell 工具 timeout 兜底（chunked sleep）。**
 
 | 环境 | 单段命令（60s） | 通过哪个 shell 工具调用 |
 |------|----------------|----------------------|
-| **Windows PowerShell 5.1** (opencode/Cursor on Windows 默认) | `Start-Sleep -Seconds 60` × 3 次 | `bash` / `Bash` / `shell` |
-| **Windows + Git Bash / WSL** | `sleep 60` × 3 次 | `bash` / `Bash` / `shell` |
-| **macOS / Linux** | `sleep 60` × 3 次 | `bash` / `Bash` / `shell` |
-| **跨平台兜底（POSIX 不可用时）** | `python -c "import time; time.sleep(60)"` × 3 次 | shell 工具 |
+| **Windows PowerShell 5.1** (opencode/Cursor on Windows 默认) | `Start-Sleep -Seconds 60` × 2 次 | `bash` / `Bash` / `shell` |
+| **Windows + Git Bash / WSL** | `sleep 60` × 2 次 | `bash` / `Bash` / `shell` |
+| **macOS / Linux** | `sleep 60` × 2 次 | `bash` / `Bash` / `shell` |
+| **跨平台兜底（POSIX 不可用时）** | `python -c "import time; time.sleep(60)"` × 2 次 | shell 工具 |
 
 **检测顺序**（伪代码 + 具体探测命令）：
 
@@ -1793,12 +1821,12 @@ def sleep_in_foreground(total_seconds):
             run("python -c \"import time; time.sleep({this_round})\"")
         remaining -= this_round
         # 注意：每个 chunk 之间检查一次「停止」字样（CRITICAL RULE #5），
-        # 这样用户说停止后最长 60 秒内就能响应，而不是非得等满 180 秒
+        # 这样用户说停止后最长 60 秒内就能响应，而不是非得等满 120 秒
 ```
 
 这样做有 3 个好处：
 1. **不被 shell 工具 timeout kill** —— 每段 60s 远低于任何 Agent 上限
-2. **停止响应更快** —— 用户说「停止」最长等 60s（chunk 间检查），不再是 180s
+2. **停止响应更快** —— 用户说「停止」最长等 60s（chunk 间检查），不再是 120s
 3. **跨 Agent 一致** —— codex/cursor/opencode/claude code 都按同一节奏切片
 
 **仍然禁止**：把 chunk 改成 `Start-Job` / `&` / `setTimeout` 异步触发 —— 切片必须**串行同步**，每个 chunk 必须等上一个 chunk 完整返回后才开始下一个。
@@ -1881,7 +1909,7 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
         "elements": [
           {
             "tag": "plain_text",
-            "content": "🤖 上班看球播报员 | 下次更新: 3分钟后"
+            "content": "🤖 上班看球播报员 | 下次更新: 2分钟后"
           }
         ]
       }
@@ -1963,7 +1991,7 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
         "elements": [
           {
             "tag": "plain_text",
-            "content": "🤖 上班看球播报员 | 下次更新: 3分钟后"
+            "content": "🤖 上班看球播报员 | 下次更新: 2分钟后"
           }
         ]
       }
@@ -2111,7 +2139,7 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
   "msgtype": "markdown",
   "markdown": {
     "title": "🏀 NBA 实时播报",
-    "text": "## 🏀 NBA 实时播报\n\n**洛杉矶湖人 vs 金州勇士**\n\n- 🕐 第一节 8:32\n- 🏟️ Crypto.com Arena\n\n---\n\n### 📊 当前比分\n\n**湖人 18 - 15 勇士**\n\n---\n\n### 📈 节间数据\n\n**湖人**: 命中率 45%, 篮板 8, 助攻 4\n\n**勇士**: 命中率 40%, 篮板 6, 助攻 3\n\n---\n\n> 🤖 上班看球播报员 | 下次更新: 3分钟后"
+    "text": "## 🏀 NBA 实时播报\n\n**洛杉矶湖人 vs 金州勇士**\n\n- 🕐 第一节 8:32\n- 🏟️ Crypto.com Arena\n\n---\n\n### 📊 当前比分\n\n**湖人 18 - 15 勇士**\n\n---\n\n### 📈 节间数据\n\n**湖人**: 命中率 45%, 篮板 8, 助攻 4\n\n**勇士**: 命中率 40%, 篮板 6, 助攻 3\n\n---\n\n> 🤖 上班看球播报员 | 下次更新: 2分钟后"
   }
 }
 ```
@@ -2136,7 +2164,7 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
   "msgtype": "markdown",
   "markdown": {
     "title": "⚽ 世界杯 实时播报",
-    "text": "## ⚽ 世界杯 实时播报\n\n**阿根廷 vs 法国**\n\n- 🕐 下半场 73'\n- 🏟️ Lusail Stadium\n\n---\n\n### 📊 当前比分\n\n**阿根廷 2 - 1 法国**\n\n---\n\n📋 **实时事件**\n\n- 71' ⚽ 梅西禁区右肋抽射破门，阿根廷再下一城\n- 68' 🔄 法国换人：吉鲁下，科洛·穆阿尼上\n- 64' 🟨 德保罗战术犯规吃到本场首张黄牌\n- 59' ⭐ 姆巴佩单刀被大马丁神扑没收\n\n---\n\n> 🤖 上班看球播报员 | 下次更新: 3分钟后"
+    "text": "## ⚽ 世界杯 实时播报\n\n**阿根廷 vs 法国**\n\n- 🕐 下半场 73'\n- 🏟️ Lusail Stadium\n\n---\n\n### 📊 当前比分\n\n**阿根廷 2 - 1 法国**\n\n---\n\n📋 **实时事件**\n\n- 71' ⚽ 梅西禁区右肋抽射破门，阿根廷再下一城\n- 68' 🔄 法国换人：吉鲁下，科洛·穆阿尼上\n- 64' 🟨 德保罗战术犯规吃到本场首张黄牌\n- 59' ⭐ 姆巴佩单刀被大马丁神扑没收\n\n---\n\n> 🤖 上班看球播报员 | 下次更新: 2分钟后"
   }
 }
 ```
@@ -2244,7 +2272,7 @@ Stage A+ 的约束（防止搜索预算爆炸）：
 
 **Q2: Stage B `webfetch` 在单步预算内超时 / 失败怎么办？**
 
-A: webfetch 在 60s 切片预算内超时 → `events=[]` 优雅跳过当前 match；不阻塞主循环。同理覆盖：HTTP 5xx、页面被反爬挡掉、LLM 提取阶段返回空 / 不合法 schema、URL 临时挂掉等所有 Stage B 失败场景。**绝对不允许**因为 commentary 抓取失败就漏掉这一轮的比分推送，更不允许让单场比赛的失败拖垮整个轮询循环。本场比赛下一轮（3 分钟后）会重新尝试 Stage B。
+A: webfetch 在 60s 切片预算内超时 → `events=[]` 优雅跳过当前 match；不阻塞主循环。同理覆盖：HTTP 5xx、页面被反爬挡掉、LLM 提取阶段返回空 / 不合法 schema、URL 临时挂掉等所有 Stage B 失败场景。**绝对不允许**因为 commentary 抓取失败就漏掉这一轮的比分推送，更不允许让单场比赛的失败拖垮整个轮询循环。本场比赛下一轮（2 分钟后）会重新尝试 Stage B。
 
 **Q3: 比分没变，事件去重后也是空，要发吗？**
 

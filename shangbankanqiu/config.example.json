@@ -10,8 +10,8 @@
     "webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxxx",
     "secret": ""
   },
-  "_comment_poll": "轮询间隔，单位秒，默认 180（3分钟），建议不低于 60 秒",
-  "poll_interval_seconds": 180,
+  "_comment_poll": "轮询间隔，单位秒，默认 120（2分钟），建议不低于 60 秒",
+  "poll_interval_seconds": 120,
   "_comment_max_polls": "单次 skill 运行最多轮询多少轮，防止无限循环。60 ≈ 3 小时",
   "max_polls": 60,
   "_comment_max_failures": "连续失败几次后停止轮询（搜索失败 + 推送失败合并计数）",

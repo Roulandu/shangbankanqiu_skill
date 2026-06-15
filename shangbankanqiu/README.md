@@ -7,7 +7,7 @@
 一个跨平台的 AI Agent Skill（技能文件），安装后可以让你的 AI Coding Agent（如 OpenCode、Claude Code、Codex、Cursor 等）化身实时比赛播报员：
 
 - 🔍 自动搜索正在进行的比赛
-- 📊 每 3 分钟更新一次赛况
+- 📊 每 2 分钟更新一次赛况
 - 📋 不只是比分——还会推送实时事件（进球、换人、犯规、关键球、红黄牌等），让你不在场也能跟上比赛节奏
 - 🎤 文字直播模式（play_by_play）—— 像文字解说员一样持续叙述比赛进程，每轮推送都有内容
 - 📲 通过飞书/钉钉群机器人推送到你的工作群
@@ -84,7 +84,7 @@ cp config.example.json config.json
     "webhook_url": "钉钉机器人 Webhook 地址",
     "secret": "加签密钥 SEC（没有则留空）"
   },
-  "poll_interval_seconds": 180,    // 轮询间隔（秒），默认3分钟
+  "poll_interval_seconds": 120,    // 轮询间隔（秒），默认2分钟
   "max_polls": 60,                 // 单次最多轮询多少次（防无限循环），默认 60
   "max_consecutive_failures": 3,   // 连续失败几次后停止轮询
   "state_file": ".shangbankanqiu_state.json", // 去重用临时文件
@@ -108,7 +108,7 @@ cp config.example.json config.json
 
 ## ⚠ 设计原则：本 Skill 不会后台化
 
-很多人误以为「每 3 分钟推送一次」就需要后台 daemon / cron / 计划任务。本 Skill **故意不那样设计**：
+很多人误以为「每 2 分钟推送一次」就需要后台 daemon / cron / 计划任务。本 Skill **故意不那样设计**：
 
 - **轮询循环跑在宿主 Agent 的当前对话里**，sleep 是**前台同步阻塞**（`Start-Sleep` / `sleep`）
 - **不会**让 Agent 创建 `.py` / `.sh` / `.ps1` 调度脚本
@@ -155,7 +155,7 @@ cp config.example.json config.json
        ↓
    推送到飞书 / 钉钉
        ↓
-   等待 3 分钟 → 重新搜索 → 循环直到比赛结束
+   等待 2 分钟 → 重新搜索 → 循环直到比赛结束
 ```
 
 > Stage A 失败（嗅探不到 URL）或 Stage B 失败（webfetch 超时 / 解析失败）时，事件列表退化为空，**比分照常推送**——不会因为抓不到 commentary 就漏掉这一轮播报。
