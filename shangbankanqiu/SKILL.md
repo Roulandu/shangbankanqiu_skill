@@ -152,7 +152,8 @@ Start-Sleep -Seconds 180   # Windows PowerShell
   "max_events_per_msg": 6,
   "commentary_dedup_window": 30,
   "commentary_style": "events_only",
-  "play_by_play_default_poll_interval_seconds": 90
+  "play_by_play_default_poll_interval_seconds": 90,
+  "search_freshness_boost": true
 }
 ```
 
@@ -168,8 +169,9 @@ Start-Sleep -Seconds 180   # Windows PowerShell
 | `commentary_dedup_window` | integer | 30 | 1–200 | `seen_event_ids` ring buffer 记多少**轮**的事件 id_hash；buffer 容量 `cap = commentary_dedup_window × max_events_per_msg`。默认 30 × 6 = 180 条 id_hash（state 文件约 9KB）。详见 §state file schema。 |
 | `commentary_style` | string | `"events_only"` | `"events_only"` / `"play_by_play"` | 播报风格。`events_only` = 仅在比分变化或出现进球/犯规等重大事件时推送（当前默认行为）。`play_by_play` = 文字直播模式——像文字解说员一样每轮推送比赛进程，即使比分未变也有叙述更新；LLM 提取更细粒度的事件类型（射门/扑救/角球等），且每轮至少产一条 `commentary` 类型事件描述当前局势。详见 §Stage B LLM prompt 变体 与 §render_live 3×2 状态表。 |
 | `play_by_play_default_poll_interval_seconds` | integer | 90 | ≥ 60 | 文字直播模式推荐的轮询间隔（秒）。当 `commentary_style == "play_by_play"` 且用户未自定义 `poll_interval_seconds`（仍为默认值 180）时，自动使用此值代替，使文字直播更「实时」。用户显式设置了非 180 的 `poll_interval_seconds` 时，以用户设置为准。 |
+| `search_freshness_boost` | boolean | `true` | `true` / `false` | 是否启用 Stage A+ Fallback（实时源精准搜索）。`true`（默认）：当 Stage A 主搜索没找到文字直播 URL 时，自动用 `site:` 限定搜索精准定位中文实时源（虎扑/新浪），大幅减少「进球后长时间检测不到」的问题。`false`：关闭此 fallback，回到旧行为（Stage A 嗅探不到 URL 时直接 `events=[]`）。详见 §build_pbp_search_query 与 FAQ Q1。 |
 
-> **⚠ 配置键命名警告（重申已有规则）**：上表所有「真实键」**绝不**以下划线 `_` 开头；只有 `_comment_*` 形态的注释兄弟键才会被 `strip_comment_keys` 剥离（见 §read_config）。把真实键写成 `_include_events` / `_max_events_per_msg` 之类**会被静默剥离**——配置看起来填了但运行时全是默认值，极难排查。`include_events` / `max_events_per_msg` / `commentary_dedup_window` / `commentary_style` / `play_by_play_default_poll_interval_seconds` 所有真实配置键**必须**按本表的字面量拼写出现在 `config.json` 顶层。
+> **⚠ 配置键命名警告（重申已有规则）**：上表所有「真实键」**绝不**以下划线 `_` 开头；只有 `_comment_*` 形态的注释兄弟键才会被 `strip_comment_keys` 剥离（见 §read_config）。把真实键写成 `_include_events` / `_max_events_per_msg` 之类**会被静默剥离**——配置看起来填了但运行时全是默认值，极难排查。`include_events` / `max_events_per_msg` / `commentary_dedup_window` / `commentary_style` / `play_by_play_default_poll_interval_seconds` / `search_freshness_boost` 所有真实配置键**必须**按本表的字面量拼写出现在 `config.json` 顶层。
 
 至少配置飞书或钉钉中的一个，两个都配置也可以（会同时推送）。
 
@@ -251,8 +253,45 @@ while poll_idx < config.max_polls:
                 m["events"] = []
                 continue
             # 1.5b. 从 Stage A snippets 选 play-by-play URL（按 §Stage A 5 行优先级表）
+            #       优先级：URL 缓存 > Stage A 嗅探 > Stage A+ 补搜
             try:
-                pbp_url = pick_playbyplay_url_from_stage_a(m)
+                match_key_for_url = m.get("home", "") + "|" + m.get("away", "")
+
+                # ── 1. 优先使用跨轮 URL 缓存（见 §state file schema pbp_urls） ──
+                # 第二轮起直接用已发现的 URL，跳过整个 URL 发现阶段，大幅减少延迟。
+                pbp_url = persisted.get("pbp_urls", {}).get(match_key_for_url)
+
+                # ── 2. 缓存 miss → 从 Stage A snippets 嗅探 ──
+                if pbp_url is None:
+                    pbp_url = pick_playbyplay_url_from_stage_a(m)
+
+                # ── 3. Stage A+ Fallback ──
+                # 当 Stage A 主搜索没返回 playbyplay URL 时，用 site: 限定搜索
+                # 精准定位中文实时源。这是解决"进球后长时间检测不到"的核心机制：
+                # Stage A 的通用搜索返回的往往是 ESPN/Google 聚合页（延迟 3-10min），
+                # 而虎扑/新浪文字直播页更新延迟仅 ~30s。但通用搜索很少返回这些页面。
+                # Stage A+ 用 site: 限定直接搜索中文源的 playbyplay 页面。
+                if pbp_url is None and config.get("search_freshness_boost", True):
+                    pbp_q   = build_pbp_search_query(match_type, m.get("home", ""), m.get("away", ""))
+                    try:
+                        pbp_raw = web_search(pbp_q)
+                        # 从 Stage A+ 搜索结果中提取 URL，复用同一套 pick_playbyplay_url 逻辑
+                        pbp_match = {"source_url": "", "raw": pbp_raw}  # 临时 match dict，仅用于 URL 嗅探
+                        # 尝试从搜索结果中找 source_url
+                        pbp_urls_from_raw = extract_urls_from_text(pbp_raw or "")
+                        if pbp_urls_from_raw:
+                            pbp_match["source_url"] = pbp_urls_from_raw[0]      # 取第一个 URL 作为 source_url
+                        pbp_match["raw"] = pbp_raw or ""
+                        pbp_url = pick_playbyplay_url_from_stage_a(pbp_match)
+                    except Exception:
+                        pbp_url = None                                  # Stage A+ 也失败 → 优雅回退
+
+                # ── 4. 写入 URL 缓存（发现即缓存，后续轮次直接复用） ──
+                if pbp_url is not None:
+                    if "pbp_urls" not in persisted:
+                        persisted["pbp_urls"] = {}
+                    persisted["pbp_urls"][match_key_for_url] = pbp_url
+
                 if pbp_url is None:
                     m["events"] = []
                     continue
@@ -271,6 +310,74 @@ while poll_idx < config.max_polls:
     else:
         for m in fresh:
             m["events"] = []                              # include_events=false → 退化成纯比分模式
+
+    # ---- 第 1.7 步: SCORE-CHANGE EVENT SYNTHESIS（比分变化事件合成） ----
+    # 当 Stage B 完全失败（events=[]）但比分发生变化时，合成进球事件。
+    # 这是最后一道防线——即使搜索延迟、URL 缺失、webfetch 超时，只要比分变了，
+    # 用户一定能看到一条「某队进球」的推送，而不是干巴巴的「比分 0-0 → 1-0」。
+    #
+    # CRITICAL RULE #7 补充：events 不进 snapshot/dedup 是对的。但合成事件是独立的——
+    # 它们有专门的 id_hash 前缀 "syn:" ，不会与 Stage B 的真实事件冲突。
+    # 合成事件只在 events=[] 且比分变化时才产生；Stage B 正常工作时不会触发。
+    if last_pushed_score is not None and config.include_events:
+        # 将 last_pushed_score（list of {home, away, score, phase}）转为 match_key → score dict
+        # 便于按 match_key 查找旧比分。last_pushed_score 来自 extract_score_snapshot，
+        # 其结构是 [{"home": "Lakers", "away": "Celtics", "score": "98-92", "phase": "Q3"}, ...]
+        old_score_map = {}
+        for s in last_pushed_score:
+            key = s.get("home", "") + "|" + s.get("away", "")
+            old_score_map[key] = s.get("score", "")          # e.g. "0-0" or "98-92"
+
+        for m in fresh:
+            # 仅对正在直播的场次做合成
+            phase_kws = m.get("phase_keywords", []) or []
+            live_kws  = {"Live", "直播中", "Q1", "Q2", "Q3", "Q4", "OT", "1H", "2H",
+                         "上半场", "下半场", "加时", "进行中", "中场"}
+            if not any(kw in phase_kws for kw in live_kws):
+                continue
+            # 仅当 Stage B 返回空事件时才合成——如果 Stage B 已抓到真实事件，不需要合成
+            if len(m.get("events", [])) > 0:
+                continue
+            # 检查该场比赛比分是否变化
+            match_key = m.get("home", "") + "|" + m.get("away", "")
+            old_score_raw = old_score_map.get(match_key)       # e.g. "0-0"
+            new_score_raw = m.get("score", "")                 # e.g. "1-0" or "98-92"
+            if not old_score_raw or not new_score_raw:
+                continue
+            # 解析新旧比分
+            try:
+                old_parts = old_score_raw.replace("–", "-").replace(":", "-").split("-")
+                new_parts = new_score_raw.replace("–", "-").replace(":", "-").split("-")
+                if len(old_parts) != 2 or len(new_parts) != 2:
+                    continue
+                old_home, old_away = int(old_parts[0].strip()), int(old_parts[1].strip())
+                new_home, new_away = int(new_parts[0].strip()), int(new_parts[1].strip())
+            except (ValueError, IndexError):
+                continue
+            home_delta = new_home - old_home
+            away_delta = new_away - old_away
+            # 合成进球事件
+            syn_events = []
+            if home_delta > 0:
+                for _ in range(home_delta):
+                    syn_events.append({
+                        "id_hash": "syn:" + sha1((match_key + "|" + new_score_raw + "|home_goal").encode("utf-8"))[:10],
+                        "ts":      "",
+                        "team":    "home",
+                        "type":    "goal",
+                        "text":    m.get("home", "") + " 进球！比分 " + new_score_raw,
+                    })
+            if away_delta > 0:
+                for _ in range(away_delta):
+                    syn_events.append({
+                        "id_hash": "syn:" + sha1((match_key + "|" + new_score_raw + "|away_goal").encode("utf-8"))[:10],
+                        "ts":      "",
+                        "team":    "away",
+                        "type":    "goal",
+                        "text":    m.get("away", "") + " 进球！比分 " + new_score_raw,
+                    })
+            if syn_events:
+                m["events"] = syn_events
 
     # ---- 第 2 步: RENDER + PUSH GATE ----
     state          = classify_state(fresh)                # 每轮都要重判，状态会变化（直播→完结）
@@ -372,9 +479,11 @@ while poll_idx < config.max_polls:
         cap_ring = config.commentary_dedup_window * config.max_events_per_msg
         if len(persisted["seen_event_ids"]) > cap_ring:
             persisted["seen_event_ids"] = persisted["seen_event_ids"][-cap_ring:]
-        # 4c. 整体写盘（score + ts + seen_event_ids 一次性原子持久化）
+        # 4c. 整体写盘（score + ts + seen_event_ids + pbp_urls 一次性原子持久化）
         persisted["score"] = score_snapshot
         persisted["ts"]    = now()
+        # pbp_urls 已在 §第 1.5 步中发现时即时写入 persisted dict，
+        # 这里随整体写盘一起持久化到磁盘。
         write_state_file_safely(state_path, persisted)
 
     # ---- 第 5 步: TERMINATE? ----
@@ -437,18 +546,27 @@ config = strip_comment_keys(json.parse(read("config.json")))
 #### `build_query(match_type, follow)` —— Stage A: 比分搜索 + 文字直播 URL 嗅探
 
 ```text
-base = {
-  "世界杯": "FIFA World Cup live scores today",
-  "NBA":   "NBA live scores today",
-}[match_type]
+def build_query(match_type, follow):
+    """返回 Stage A 主搜索查询（单条）。
+    策略：中英混合查询，确保搜索引擎同时返回中文（虎扑/新浪）和英文（ESPN）结果。
+    中文关键词在前——大多数搜索引擎对查询前段的词赋予更高权重，
+    这有助于将中文实时源（更新延迟 ~30s）排在英文聚合页（延迟 3–10min）之前。"""
+    base = {
+      "世界杯": "世界杯 比分 直播 FIFA World Cup live scores today",
+      "NBA":   "NBA 比分 直播 NBA live scores today",
+    }[match_type]
 
-if follow is non-empty:
-    return base + " " + follow            # 例: "NBA live scores today Lakers"
-else:
-    return base                           # 不要拼接空的 "+"，避免查询畸形
+    if follow is non-empty:
+        return base + " " + follow            # 例: "NBA 比分 直播 NBA live scores today 湖人"
+    else:
+        return base                           # 不要拼接空的 "+"，避免查询畸形
 ```
 
-**Stage A 双重职责（当 `config.include_events=true` 时）**：本函数的签名和 base 字符串保持不变；但当 `include_events=true` 时，调用 `web_search(build_query(...))` 之后，Agent **必须额外做一件事**：扫描搜索结果的 snippet / 摘要 / 链接列表，**留住**任何看起来像「文字直播 / 文字实录 / play-by-play / commentary」页面的 URL，作为后续 Stage B（见下方 §Stage B: Event Extraction）的事件抓取入口。被 Stage A 截获的 URL 应该在 match dict 里以 `source_url` 字段透传到 Stage B（或由 Agent 内部保留在临时变量里，二选一，按宿主 Agent 习惯实现），**不要重新发起一次 web_search**。
+> **为什么中英混合**：纯英文 `"NBA live scores today"` 几乎只返回 ESPN/Google 体育聚合页——这些页面对中文比赛源有 3–10 分钟的天然延迟，且搜索结果中极少包含 `nba.hupu.com` 或 `match.sports.sina.com.cn` 的文字直播 URL，导致 Stage B 的 URL 嗅探几乎必然 miss（见 §Stage A+ Fallback 的设计动机）。在查询前段加入 `比分 直播` 等中文关键词后，搜索引擎更可能返回虎扑/新浪等中文实时页面，大幅提高 Stage A → Stage B 的 URL 传递成功率。
+
+**Stage A 双重职责（当 `config.include_events=true` 时）**：本函数的签名和 base 字符串保持不变；但当 `include_events=true` 时，调用 `web_search(build_query(...))` 之后，Agent **必须额外做一件事**：扫描搜索结果的 snippet / 摘要 / 链接列表，**留住**任何看起来像「文字直播 / 文字实录 / play-by-play / commentary」页面的 URL，作为后续 Stage B（见下方 §Stage B: Event Extraction）的事件抓取入口。被 Stage A 截获的 URL 应该在 match dict 里以 `source_url` 字段透传到 Stage B（或由 Agent 内部保留在临时变量里，二选一，按宿主 Agent 习惯实现）。
+
+> **如果 Stage A 没嗅探到 URL**：不要在 `build_query` 这一步补搜——Stage A+ Fallback（§`build_pbp_search_query`）会在主循环 §第 1.5 步中按需触发，与主搜索解耦。
 
 **URL 优先级链**（Agent 嗅探时按此顺序匹配，命中第一条就停）：
 
@@ -461,6 +579,66 @@ else:
 完整的 shape / pitfalls / fallback 规则全部写在下方 §Stage B 的 source priority chain 表里，**这里不重复**，避免双源真理。
 
 如果 `include_events=false`（默认值或用户显式关闭），Stage A **跳过** URL 嗅探，搜索结果只用于比分/状态判断，下游 Stage B 整段不执行。这是 §Graceful Degradation 的第一档。
+
+#### `build_pbp_search_query(match_type, home, away)` —— Stage A+ Fallback: 文字直播 URL 精准搜索
+
+**设计动机**：Stage A 的 `build_query` 是通用搜索，返回的搜索结果以比分聚合页为主，很少包含 `nba.hupu.com` 或 `match.sports.sina.com.cn` 的文字直播 URL。当 `pick_playbyplay_url_from_stage_a` 返回 None 时，Stage B 整段跳过 → `events=[]` → 用户看到"进球后几轮播报都无事件"。
+
+**Stage A+ 是一个有节制的 fallback**：
+- **仅**在 Stage A 主搜索没找到 playbyplay URL 时触发（由主循环 §第 1.5 步 控制）
+- **每场每轮最多 1 次额外搜索**——不是无限制地反复搜索
+- 受 `search_freshness_boost` 配置控制（默认 `true`；设为 `false` 可关闭此 fallback，回到旧行为）
+- 搜索失败时优雅回退 `events=[]`，不阻塞主循环
+
+```text
+def build_pbp_search_query(match_type, home, away):
+    """返回 Stage A+ 的 site: 限定搜索查询。
+    策略：用 site: 限定直接搜索中文实时源的 playbyplay 页面，
+    而非依赖通用搜索偶然返回这些页面。"""
+    if match_type == "NBA":
+        # 虎扑是中文 NBA 文字直播首选源（更新延迟 ~30s）
+        # 例: "site:nba.hupu.com/games 湖人 勇士 文字直播"
+        team_part = ""
+        if home and away:
+            team_part = " " + home + " " + away
+        return "site:nba.hupu.com/games" + team_part + " 文字直播"
+    elif match_type == "世界杯":
+        # 新浪是中文足球直播首选源（ESPN 英文源延迟更大）
+        # 例: "site:match.sports.sina.com.cn 巴西 德国 直播"
+        team_part = ""
+        if home and away:
+            team_part = " " + home + " " + away
+        return "site:match.sports.sina.com.cn" + team_part + " 直播"
+    else:
+        # 未知赛事类型：通用中文搜索
+        team_part = ""
+        if home and away:
+            team_part = " " + home + " " + away
+        return match_type + team_part + " 文字直播 play-by-play"
+```
+
+> **为什么不直接在 `build_query` 里加 site: 限定**：`build_query` 同时承担比分搜索和 URL 嗅探双重职责。加 site: 限定会大幅缩小搜索范围，导致比分/状态信息不全（例如 `site:nba.hupu.com` 只返回虎扑页面，拿不到 ESPN scoreboard 的比分）。Stage A+ 将这两个职责解耦——主搜索负责全面覆盖，fallback 负责精准定位实时源。
+
+#### Score-Change Event Synthesis（比分变化事件合成）
+
+**设计动机**：即使启用了 Stage A+ Fallback，仍然可能出现 Stage B 完全失败的场景（webfetch 超时、反爬挡掉、页面 JS-only 拿不到事件等）。此时 `events=[]`，但比分已经从 0-0 变成 1-0——用户明明知道有进球，却只看到一条干巴巴的「比分 0-0 → 1-0」推送，没有任何进球事件。
+
+**解决方案**：在主循环 §第 1.7 步，当 `events=[]` 且比分发生变化时，自动合成进球事件。这是最后一道防线——确保即使所有搜索和抓取都失败，用户仍能看到一条「某队进球！」的推送。
+
+**合成规则**：
+
+1. **触发条件**：`m["events"] == []`（Stage B 完全失败/未执行）**且** 该场比赛比分发生变化（通过对比 `last_pushed_score` 与当前 `score`）
+2. **合成内容**：根据比分差值生成进球事件。例如比分从 0-0 变成 1-0 → 合成 1 条 `type="goal"` 事件；0-0 变成 2-1 → 合成 3 条事件（2 条主队进球 + 1 条客队进球）
+3. **`id_hash` 前缀**：合成事件使用 `"syn:"` 前缀（10 字符），与 Stage B 的真实事件（sha1[:12]）无冲突风险。格式：`"syn:" + sha1((match_key + "|" + score + "|" + team_side + "_goal"))[:10]`
+4. **`text` 模板**：`"{队名} 进球！比分 {新比分}"`——简洁但信息充分
+5. **`ts` 为空**：合成事件没有精确时间戳（我们只知道"这一轮比分变了"，不知道进球发生的精确时刻）
+6. **不去重 Stage B 的真实事件**：如果 Stage B 在下一轮成功抓到真实进球事件（有精确 ts 和详细描述），该真实事件的 `id_hash` 与合成事件不同，不会被 `seen_event_ids` 误去重。用户可能看到同一次进球的两条推送（合成 → 真实），但这是可接受的——宁可多推一条，不可漏推。
+
+**不触发的场景**：
+- Stage B 返回了真实事件（`len(m["events"]) > 0`）→ 不需要合成
+- `include_events=false` → 整段合成跳过
+- 比分未变化 → 不合成
+- 首轮（`last_pushed_score is None`）→ 无旧比分可对比，不合成
 
 #### `parse_search_result(raw)` —— 把非结构化搜索结果归一化
 
@@ -610,11 +788,38 @@ for match in matches:
     if not any(kw in phase_kws for kw in live_kws):
         continue                                      # 未开始/已完结不抓事件
 
-    # 1a. 从 Stage A 截获的搜索结果 snippets / 链接里，按 §Stage A URL 优先级链
-    #     选出该场比赛的 play-by-play URL（同一场比赛只挑一条，按表 1→5 顺序）。
-    pbp_url = pick_playbyplay_url_from_stage_a(match)
+    # 1a. URL 发现优先级：缓存 > Stage A 嗅探 > Stage A+ 补搜
+    #     （与 §主循环 第 1.5 步完全一致，这里列出等价逻辑供参考）
+    match_key_for_url = match.get("home", "") + "|" + match.get("away", "")
 
-    # 1b. 找不到 URL → graceful skip
+    # 1a-1. 优先使用跨轮 URL 缓存
+    pbp_url = persisted.get("pbp_urls", {}).get(match_key_for_url)
+
+    # 1a-2. 缓存 miss → 从 Stage A 截获的搜索结果 snippets / 链接里嗅探
+    if pbp_url is None:
+        pbp_url = pick_playbyplay_url_from_stage_a(match)
+
+    # 1a-3. 找不到 URL → 尝试 Stage A+ Fallback（见 §build_pbp_search_query）
+    #     Stage A+ 用 site: 限定搜索精准定位中文实时源，受 search_freshness_boost 配置控制
+    if pbp_url is None:
+        if config.get("search_freshness_boost", True):
+            pbp_q = build_pbp_search_query(match_type, match.get("home", ""), match.get("away", ""))
+            try:
+                pbp_raw = web_search(pbp_q)
+                pbp_match = {"source_url": "", "raw": pbp_raw or ""}
+                pbp_urls = extract_urls_from_text(pbp_raw or "")
+                if pbp_urls:
+                    pbp_match["source_url"] = pbp_urls[0]
+                pbp_url = pick_playbyplay_url_from_stage_a(pbp_match)
+            except Exception:
+                pbp_url = None
+
+    # 1a-4. 写入 URL 缓存
+    if pbp_url is not None:
+        if "pbp_urls" not in persisted:
+            persisted["pbp_urls"] = {}
+        persisted["pbp_urls"][match_key_for_url] = pbp_url
+
     if pbp_url is None:
         match["events"] = []
         log("no play-by-play source for " + match.get("home", "") + " vs " + match.get("away", "") + ", skip Stage B")
@@ -1068,7 +1273,8 @@ except (parse error / IO error):
 {
   "score":           <score_snapshot>,                 # 见 §extract_score_snapshot；用于比分去重
   "ts":              "<ISO 8601 字符串或 unix 时间戳>",  # 写入时刻，便于排查
-  "seen_event_ids":  ["<id_hash>", "<id_hash>", ...]   # 已推送过的事件去重环形缓冲区
+  "seen_event_ids":  ["<id_hash>", "<id_hash>", ...],  # 已推送过的事件去重环形缓冲区
+  "pbp_urls":        {"<match_key>": "<url>", ...}     # 已发现的文字直播 URL 缓存（跨轮复用）
 }
 ```
 
@@ -1090,6 +1296,19 @@ except (parse error / IO error):
 - 边界：环形缓冲区只在**单次 Skill 运行的会话期间**起作用。退出时 §cleanup_state 仍然会**整文件删除** `state_file`，所以 `seen_event_ids` 的去重是**会话内**有效的，不会污染下一次运行——这是设计如此，不是 bug。
 
 读取兼容性：旧版本 `state_file` 没有 `seen_event_ids` 字段，`read_state_file` 必须把缺失字段当作空数组 `[]` 处理，不视为损坏。
+
+**`pbp_urls` 字段**：
+
+- 类型：字典，key 为 `match_key`（`home + "|" + away`），value 为文字直播页 URL 字符串。
+- 语义：**跨轮复用的 URL 缓存**——一旦在某轮通过 Stage A 或 Stage A+ 发现了某场比赛的 playbyplay URL，缓存到此处，后续轮次直接使用，无需重新嗅探/搜索。
+- 设计动机：每轮重新发现 URL 是造成延迟的重要原因——Stage A 搜索可能返回旧结果，Stage A+ 额外搜索增加开销。缓存后，第二轮起直接用已发现的 URL 进入 Stage B webfetch，跳过整个 URL 发现阶段。
+- 维护规则：
+  1. 在 §第 1.5 步中，发现 URL 后立即写入 `persisted["pbp_urls"][match_key]`。
+  2. 每轮 PERSIST 步骤（推送成功后）将 `pbp_urls` 一起写盘。
+  3. webfetch 失败时**不清除**缓存——可能是临时网络问题，下一轮重试同一 URL。
+  4. 比赛结束（`is_finished`）时，§cleanup_state 整文件删除，pbp_urls 自然清空。
+- 边界：同 `seen_event_ids`，仅在单次 Skill 运行会话期间有效。
+- 读取兼容性：旧版本 `state_file` 没有 `pbp_urls` 字段，`read_state_file` 必须把缺失字段当作空字典 `{}` 处理。
 
 #### `cleanup_state(path)`
 
@@ -1956,6 +2175,7 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
 | 10 | **语言** | 所有播报内容使用 `config.language`（默认 zh-CN） |
 | 11 | **commentary_style 决定推送频率** | `events_only` = 仅在比分变化或出现新事件时推送；`play_by_play` = 每轮必推，即使比分未变。用户选择文字直播模式时期望的就是持续更新。 |
 | 12 | **play_by_play 的 commentary 兜底** | `play_by_play` 模式下，如果本轮无具体技术事件，LLM **必须**产至少 1 条 `type="commentary"` 事件描述当前局势。这保证每轮推送都有内容，不会发空消息。 |
+| 13 | **Stage A+ Fallback 提升实时性** | 当 Stage A 主搜索没找到文字直播 URL 时，若 `search_freshness_boost=true`（默认），Agent **必须**用 `build_pbp_search_query` 发起 site: 限定搜索精准定位中文实时源（虎扑/新浪），而非直接 `events=[]` 静默回退。这是解决"进球后长时间检测不到"的核心机制。每场每轮最多 1 次额外搜索，搜索失败时优雅回退 `events=[]`。 |
 
 ---
 
@@ -1963,14 +2183,14 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
 
 ```
 用户: 帮我看下现在有什么NBA比赛
-Agent: [read config.json] → [web_search "NBA live scores today"]
+Agent: [read config.json] → [web_search "NBA 比分 直播 NBA live scores today"]
        → 检测到 2 场进行中
        → [render_live + sign_and_post] (一条消息汇总两场)
        → [Start-Sleep -Seconds 180] ← Windows PowerShell 同步阻塞
-       → 醒来 → [web_search] → [post] → [sleep] → ... 循环
+       → 醒来 → [web_search] → [Stage A+ fallback if needed] → [post] → [sleep] → ... 循环
 
 用户: 世界杯有比赛吗
-Agent: [read config.json] → [web_search "FIFA World Cup live scores"]
+Agent: [read config.json] → [web_search "世界杯 比分 直播 FIFA World Cup live scores today"]
        → 检测到 1 场未开始
        → [render_preview + sign_and_post]
        → 退出（不进入轮询）
@@ -2007,7 +2227,20 @@ Agent: [render_final + sign_and_post] → 退出循环
 
 **Q1: Stage A 嗅探不到 play-by-play URL 怎么办？**
 
-A: play-by-play URL 找不到 → `events=[]` 静默回退；推送照旧（仅比分）。Agent **不要**为此再额外发起一次 web_search 强搜，也**不要**因此跳过该轮推送——比分本身就是有用信息。日志里记一行 `no play-by-play source for {home} vs {away}, skip Stage B` 即可，渲染器看到 `msg.events == []` 会自动走 3 元素飞书卡片 / 「title + body + footer」钉钉 markdown 退化路径。
+A: **Stage A+ Fallback 会自动补搜**（当 `search_freshness_boost=true` 时，这是默认值）。完整流程：
+
+1. Stage A 主搜索（`build_query`）→ `pick_playbyplay_url_from_stage_a` 返回 None
+2. **Stage A+ Fallback**：用 `build_pbp_search_query` 构建 site: 限定搜索（如 `site:nba.hupu.com/games 湖人 勇士 文字直播`），精准定位中文实时源
+3. Stage A+ 也找不到 URL → `events=[]` 静默回退；推送照旧（仅比分）
+4. **绝对不允许**因此跳过该轮推送——比分本身就是有用信息
+
+Stage A+ 的约束（防止搜索预算爆炸）：
+- 每场每轮**最多 1 次**额外 `web_search`
+- 仅在 Stage A 主搜索没找到 URL 时触发
+- 受 `search_freshness_boost` 配置控制，设为 `false` 可关闭（回到旧行为：直接 `events=[]`）
+- Stage A+ 搜索本身失败时优雅回退 `events=[]`，不阻塞主循环
+
+如果 `search_freshness_boost=false`（旧行为）：Stage A 嗅探不到 → 直接 `events=[]`，不再补搜。日志里记一行 `no play-by-play source for {home} vs {away}, skip Stage B` 即可，渲染器看到 `msg.events == []` 会自动走 3 元素飞书卡片 / 「title + body + footer」钉钉 markdown 退化路径。
 
 **Q2: Stage B `webfetch` 在单步预算内超时 / 失败怎么办？**
 
@@ -2032,5 +2265,32 @@ A: 这是 play_by_play 模式的设计意图。用户选择文字直播，就是
 **Q5: play_by_play 模式会不会刷屏太频繁？**
 
 A: 有三层控制：(1) `poll_interval_seconds` 在 play_by_play 模式下自动从 180s 降为 90s（可通过 `play_by_play_default_poll_interval_seconds` 配置或手动设 `poll_interval_seconds` 自定义）；(2) `max_events_per_msg` 控制每条消息的事件数上限；(3) 钉钉 18KB size guard 自动截断过长消息。如果仍然觉得太频繁，调大 `poll_interval_seconds` 或切回 `events_only` 模式即可。
+
+**Q6: 为什么进球后很长时间才检测到？`search_freshness_boost` 有什么用？**
+
+A: 这是数据源延迟问题，有两层原因：
+
+1. **搜索引擎缓存**：`web_search` 返回的往往是 ESPN/Google 体育聚合页，这些页面对比赛事件的更新延迟 3–10 分钟（中文源更慢）。进球已经发生了，但搜索引擎返回的仍是旧比分。
+2. **文字直播 URL 缺失**：Stage A 通用搜索（`build_query`）主要返回比分聚合页，很少包含虎扑/新浪的文字直播 URL。没有 URL → Stage B 跳过 → `events=[]` → 用户看到"进球后几轮播报都无事件"。
+
+**`search_freshness_boost=true`（默认）启用 Stage A+ Fallback**：当 Stage A 主搜索没找到文字直播 URL 时，自动用 `site:` 限定搜索精准定位中文实时源（如 `site:nba.hupu.com/games 湖人 勇士 文字直播`）。虎扑/新浪文字直播页的更新延迟仅 ~30s，远快于搜索引擎聚合页的 3–10min。
+
+另外，`build_query` 已改为中英混合查询（如 `"NBA 比分 直播 NBA live scores today"`），中文关键词在前有助于搜索引擎优先返回中文实时源。
+
+如果不想增加额外搜索开销，设 `"search_freshness_boost": false` 可关闭 Stage A+ fallback，回到旧行为。
+
+**Q7: URL 缓存和比分变化事件合成是什么？**
+
+A: 这是两个互补的实时性优化机制：
+
+1. **URL 缓存（`pbp_urls`）**：一旦通过 Stage A 或 Stage A+ 发现了某场比赛的文字直播 URL，缓存到 state file 中。后续轮次直接从缓存取 URL 进入 Stage B webfetch，跳过整个 URL 发现阶段。这意味着第二轮起，Agent 可以更快地拿到实时数据——不需要每次都重新搜索和嗅探 URL。
+
+2. **比分变化事件合成（Score-Change Event Synthesis）**：这是最后一道防线。即使 Stage B 完全失败（webfetch 超时、反爬、JS-only 页面等），只要比分从 0-0 变成 1-0，系统自动合成一条「某队进球！比分 1-0」的 goal 事件。用户不会只看到干巴巴的比分变化，而是能看到一条有意义的进球推送。合成事件的 `id_hash` 使用 `"syn:"` 前缀，不会与 Stage B 的真实事件冲突。如果下一轮 Stage B 成功抓到真实进球事件（有精确时间戳和详细描述），用户可能看到同一次进球的两条推送——但宁可多推一条，不可漏推。
+
+这两个机制与 Stage A+ Fallback 一起构成了三层实时性保障：
+- **第一层**：`build_query` 中英混合查询 → 提高首轮中文源命中率
+- **第二层**：Stage A+ `site:` 精准搜索 → 首轮未命中时补搜
+- **第三层**：URL 缓存 → 第二轮起跳过 URL 发现阶段
+- **第四层**：比分变化事件合成 → 所有搜索/抓取都失败时的兜底
 
 ---
