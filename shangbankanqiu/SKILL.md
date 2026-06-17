@@ -1755,6 +1755,9 @@ def render_live(fresh, last_pushed_score, score_snapshot, config):
 
     # 把每个 match.new_events（由主循环 push gate 预先填充，见 §主循环 push gate）
     # 平铺到 msg.events 数组——见 §msg schema (events 字段)
+    # Football play_by_play 渲染时按 evidence-constrained 事件重新编排：
+    # commentary narrative/situation lines → 细颗粒动作 → key events。
+    # 渲染器只排序/展示已有证据约束的事件，不生成或补写 narrative。
     # CRITICAL（P0-3, Oracle Round 11）：m 是 dict，必须用 m.get("new_events", [])。
     # **绝不**写 getattr(m, "new_events", [])——Python 的 getattr 检查 attribute 不是 dict key，
     # 对 dict 永远返默认 [] → events 永远渲染不出来 → 整个 events 特性静默失效（与 §主循环 2a/2c 同源 bug）。
@@ -1873,7 +1876,7 @@ return msg
 **`msg.events` 字段语义补充**（即 `msg["events"]`）：
 
 - **来源**：`render_live` 把 `fresh` 中每个 match 的 `m.new_events`（已经过主循环 push gate 的 dedup + trim，见 §主循环 push gate）平铺到 `msg.events`。
-- **顺序**：保持平铺时的顺序（一般是按 match 顺序、再按事件抓取顺序），渲染器**不**重排。
+- **顺序**：保持平铺时的顺序（一般是按 match 顺序、再按事件抓取顺序）。但足球 `play_by_play` 展示由渲染器套用 `football_play_by_play_format(events)`：先展示 `commentary` narrative/situation lines，再展示细颗粒动作（`pass` / `long_ball` / `dribble` / `interception` / `clearance` / `cross` / `duel` / `offside` / `possession`），最后展示 key events（`goal` / `card` / `sub` / `shot` / `save` / `corner` / `free_kick` / `foul` / `key_play` / `other`）。渲染器不编造 narrative；它只排序/展示已经被数据源证据约束的事件。
 - **空列表合法**：`msg.events == []` 是合法状态，渲染器必须优雅处理（飞书卡片省略事件 div，钉钉省略事件 bullet 段）——见下方 §render_feishu_card 与 §render_dingtalk_md 的具体规则。
 - **不重复定义 schema**：event-item 字段（`id_hash` / `ts` / `team` / `type` / `text`）的所有约束在 §parse_search_result 已规定，本节**不**重复——避免双源真理。
 
@@ -1927,17 +1930,16 @@ elements = []
 elements.append({ "tag": "div", "text": { "tag": "lark_md", "content": msg.body } })  # Element 1: 比分（始终存在）
 if len(msg.events) > 0:
     if config.get("commentary_style", "events_only") == "play_by_play":
-        # play_by_play: narrative header + bullets with type-emoji
-        # Separate commentary-type events (narrative lines) from action events
-        commentary_lines = [e for e in msg.events if e.get("type") == "commentary"]
-        action_lines     = [e for e in msg.events if e.get("type") != "commentary"]
+        # play_by_play: football_play_by_play_format ordering with type-emoji.
+        # Renderer does not fabricate narrative; it only orders/displays events
+        # already constrained by provider extended_timeline or original commentary evidence.
+        ordered_events = football_play_by_play_format(msg.events)
         bullet_parts = []
-        if commentary_lines:
-            # Narrative lines go first, rendered with 📝 marker
-            for e in commentary_lines:
+        for e in ordered_events:
+            if e.get("type") == "commentary":
                 bullet_parts.append("- 📝 " + e["text"])
-        for e in action_lines:
-            bullet_parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
+            else:
+                bullet_parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
         elements.append({ "tag": "div", "text": { "tag": "lark_md",
             "content": "🎤 **文字直播**\n" + "\n".join(bullet_parts)
         } })                                                                              # Element 2: 文字直播（play_by_play）
@@ -1972,8 +1974,9 @@ elements.append({ "tag": "note", "elements": [{
     { "tag": "div", "text": { "tag": "lark_md", "content": msg.body } },
     { "tag": "div", "text": { "tag": "lark_md", "content":
         "🎤 **文字直播**\n"
-        + (narrative_lines: "- 📝 " + e.text for commentary-type events)
-        + (action_lines: "- " + e.ts + " " + emoji_for(e) + " " + e.text for non-commentary events)
+        + (ordered_events from football_play_by_play_format(msg.events):
+           "- 📝 " + e.text for commentary events,
+           otherwise "- " + e.ts + " " + emoji_for(e) + " " + e.text)
     } },
     { "tag": "hr" },
     { "tag": "note", "elements": [{ "tag": "plain_text", "content": msg.footer }] }
@@ -1988,7 +1991,7 @@ elements.append({ "tag": "note", "elements": [{
 1. 当 `msg.events == []` → **省略 Element 2**，elements 数组只剩 3 项（div / hr / note），与历史卡片**完全一致（向后兼容）**。
 2. 当 `msg.events` 非空 → 在 Element 1 之后、Element 3（`hr`）之前插入事件 div，elements 数组为 4 项。
 3. 事件 div 的 `lark_md` 正文以 `📋 **实时事件**\n` 起头，随后每条事件占一行 bullet：`- {ts} {emoji} {text}`（`ts` 为空字符串时 bullet 仍保留两个空格防止排版崩裂，由渲染器实现兜底）。
-4. 事件展示顺序与 `msg.events` 数组顺序一致——`render_live` 已保证按 match → event 抓取序铺平，渲染器不重排。
+4. `events_only` 事件展示顺序与 `msg.events` 数组顺序一致；足球 `play_by_play` 必须套用 `football_play_by_play_format(events)`：`commentary` narrative/situation lines → 细颗粒动作（`pass` / `long_ball` / `dribble` / `interception` / `clearance` / `cross` / `duel` / `offside` / `possession`）→ key events（`goal` / `card` / `sub` / `shot` / `save` / `corner` / `free_kick` / `foul` / `key_play` / `other`）。渲染器不编造 narrative；它只排序/展示已经被数据源证据约束的事件。
 
 如果 `secret` 非空，由 `sign_and_post` 在该 JSON 顶层追加 `timestamp` 和 `sign` 字段。
 
@@ -2004,7 +2007,7 @@ elements.append({ "tag": "note", "elements": [{
             + (when msg.events is non-empty:
                   (config.get("commentary_style", "events_only") == "play_by_play" ?
                       "\n\n🎤 **文字直播**\n"
-                      + commentary_first_format(msg.events)
+                      + "\n".join(format_event_line(e) for e in football_play_by_play_format(msg.events))
                     : "\n\n📋 **实时事件**\n"
                       + "\n".join("- " + e.ts + " " + emoji_for(e) + " " + e.text  for e in msg.events))
               else: "")
@@ -2013,17 +2016,13 @@ elements.append({ "tag": "note", "elements": [{
 }
 ```
 
-其中 `commentary_first_format(events)` 将 `commentary` 类型事件排在最前（用 📝 标记），其余事件按原格式：
+其中 `football_play_by_play_format(events)` 取代旧的 `commentary_first_format` 行为：足球 `play_by_play` 先排 `commentary` narrative/situation lines，再排细颗粒动作，最后排 key events。渲染器不编造 narrative；它只排序/展示已经被数据源证据约束的事件：
 ```text
-def commentary_first_format(events):
-    commentary_lines = [e for e in events if e.get("type") == "commentary"]
-    action_lines     = [e for e in events if e.get("type") != "commentary"]
-    parts = []
-    for e in commentary_lines:
-        parts.append("- 📝 " + e["text"])
-    for e in action_lines:
-        parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
-    return "\n".join(parts)
+def football_play_by_play_format(events):
+    narrative = [e for e in events if e.get("type") == "commentary"]
+    fine = [e for e in events if e.get("type") in {"pass", "long_ball", "dribble", "interception", "clearance", "cross", "duel", "offside", "possession"}]
+    key = [e for e in events if e.get("type") not in {"commentary", "pass", "long_ball", "dribble", "interception", "clearance", "cross", "duel", "offside", "possession"}]
+    return narrative + fine + key
 ```
 
 拼接顺序固定为 `title → body → events 段（可选）→ 分隔线 + footer`。`emoji_for(e)` 仍然引用上方 §Event 类型 → emoji 映射 表（与飞书卡片**同一份映射，不要复制粘贴定义**）。当 `msg.events == []` 时整段事件块省略，`text` 退化为「title + body + footer」三段，与历史 markdown 输出**完全一致**。
@@ -2045,14 +2044,14 @@ def commentary_first_format(events):
           ev_block = ""
           if len(events_to_render) > 0:
               if config.get("commentary_style", "events_only") == "play_by_play":
-                  # play_by_play: commentary-first format with 🎤 header
-                  commentary_lines = [e for e in events_to_render if e.get("type") == "commentary"]
-                  action_lines     = [e for e in events_to_render if e.get("type") != "commentary"]
+                  # play_by_play: football_play_by_play_format ordering with 🎤 header
+                  ordered_events = football_play_by_play_format(events_to_render)
                   parts = []
-                  for e in commentary_lines:
-                      parts.append("- 📝 " + e["text"])
-                  for e in action_lines:
-                      parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
+                  for e in ordered_events:
+                      if e.get("type") == "commentary":
+                          parts.append("- 📝 " + e["text"])
+                      else:
+                          parts.append("- " + e["ts"] + " " + emoji_for(e) + " " + e["text"])
                   ev_block = "\n\n🎤 **文字直播**\n" + "\n".join(parts)
               else:
                   # events_only: original format
@@ -2386,6 +2385,16 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
 }
 ```
 
+富足球文字直播示例块（仅在来源支持时展示）：
+
+```markdown
+- 🧭 阿根廷中路组织推进，麦卡利斯特回接后分到右路
+- 🚀 德保罗长传找前插的莫利纳，法国边卫回追解围
+- 🧹 于帕梅卡诺禁区前沿完成解围，法国暂时化解压力
+```
+
+这些球员动作只能来自 provider extended timeline 或原始文字 commentary；如果 data source lacks details，必须退回局势级 commentary。
+
 **比分未变、有 commentary 事件时的文字直播推送**:
 
 ```json
@@ -2522,6 +2531,16 @@ sign = URLEncode(Base64(HMAC-SHA256(stringToSign, secret)))
   }
 }
 ```
+
+富足球文字直播示例块（仅在来源支持时展示）：
+
+```markdown
+- 🧭 阿根廷中路组织推进，麦卡利斯特回接后分到右路
+- 🚀 德保罗长传找前插的莫利纳，法国边卫回追解围
+- 🧹 于帕梅卡诺禁区前沿完成解围，法国暂时化解压力
+```
+
+这些球员动作只能来自 provider extended timeline 或原始文字 commentary；如果 data source lacks details，必须退回局势级 commentary。
 
 ---
 
