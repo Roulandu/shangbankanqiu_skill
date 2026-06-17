@@ -1,4 +1,4 @@
-{
+﻿{
   "_说明": "复制此文件为 config.json 并填入你的实际配置。至少配置飞书或钉钉中的一个平台。",
   "_comment_feishu": "飞书群机器人配置 — 从飞书群设置 → 群机器人 → 自定义机器人 获取",
   "feishu": {
@@ -31,5 +31,34 @@
   "_comment_play_by_play_interval": "文字直播模式推荐的轮询间隔（秒）。当 poll_interval_seconds 仍为默认 180 时，play_by_play 模式自动使用此值。范围 ≥ 60",
   "play_by_play_default_poll_interval_seconds": 90,
   "_comment_search_freshness_boost": "是否启用 Stage A+ Fallback（实时源精准搜索）。true=当 Stage A 没找到文字直播 URL 时，自动用 site: 限定搜索精准定位中文实时源（虎扑/新浪），减少进球延迟检测；false=关闭 fallback，回到旧行为",
-  "search_freshness_boost": true
+  "search_freshness_boost": true,
+  "_comment_providers": "可选足球 API 数据源。所有 provider 默认关闭；未配置 API key 时自动使用 web_search/webfetch 旧路径。",
+  "providers": {
+    "football": {
+      "priority": [
+        "sportradar_extended",
+        "sportmonks",
+        "api_football",
+        "football_data_org",
+        "web"
+      ],
+      "sportradar_extended": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "sportmonks": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "api_football": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "football_data_org": {
+        "enabled": false,
+        "api_key": "",
+        "status_only": true
+      }
+    }
+  }
 }

@@ -100,11 +100,53 @@ cp config.example.json config.json
   "play_by_play_default_poll_interval_seconds": 90,  // 文字直播模式推荐的轮询间隔（秒），当 poll_interval_seconds 仍为默认180时自动使用此值
 
   // === 实时性优化 ===
-  "search_freshness_boost": true           // 是否启用 Stage A+ Fallback：当主搜索没找到文字直播 URL 时，自动用 site: 限定搜索精准定位中文实时源（虎扑/新浪），减少进球延迟检测。设为 false 关闭
+  "search_freshness_boost": true,          // 是否启用 Stage A+ Fallback：当主搜索没找到文字直播 URL 时，自动用 site: 限定搜索精准定位中文实时源（虎扑/新浪），减少进球延迟检测。设为 false 关闭
+
+  // === 可选足球 API 数据源 ===
+  "_comment_providers": "可选足球 API 数据源。所有 provider 默认关闭；未配置 API key 时自动使用 web_search/webfetch 旧路径。",
+  "providers": {
+    "football": {
+      "priority": [
+        "sportradar_extended",
+        "sportmonks",
+        "api_football",
+        "football_data_org",
+        "web"
+      ],
+      "sportradar_extended": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "sportmonks": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "api_football": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "football_data_org": {
+        "enabled": false,
+        "api_key": "",
+        "status_only": true
+      }
+    }
+  }
 }
 ```
 
 至少配置飞书或钉钉中的一个。
+
+### 可选：足球 API 数据源
+
+足球比赛可以选择配置第三方 API provider，但这不是必需项。所有 provider 默认关闭；如果没有启用 provider，或没有填写可用的 API key，Skill 会自动沿用 `web_search` / `webfetch` 旧路径抓取比分和文字直播信息。
+
+推荐优先级：
+
+1. `sportradar_extended`：用于扩展详情。
+2. `sportmonks` / `api_football`：用于实时比分、状态、事件、统计和文字解说。
+3. `football_data_org`：用于 `PAUSED` / `FINISHED` 状态校准，避免把中场休息误判为完场。
+4. `web`：作为最终 fallback。
 
 ## ⚠ 设计原则：本 Skill 不会后台化
 

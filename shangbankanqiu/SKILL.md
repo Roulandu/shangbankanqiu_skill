@@ -153,7 +153,36 @@ Start-Sleep -Seconds 180   # Windows PowerShell
   "commentary_dedup_window": 30,
   "commentary_style": "events_only",
   "play_by_play_default_poll_interval_seconds": 90,
-  "search_freshness_boost": true
+  "search_freshness_boost": true,
+  "_comment_providers": "可选足球 API 数据源。所有 provider 默认关闭；未配置 API key 时自动使用 web_search/webfetch 旧路径。",
+  "providers": {
+    "football": {
+      "priority": [
+        "sportradar_extended",
+        "sportmonks",
+        "api_football",
+        "football_data_org",
+        "web"
+      ],
+      "sportradar_extended": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "sportmonks": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "api_football": {
+        "enabled": false,
+        "api_key": ""
+      },
+      "football_data_org": {
+        "enabled": false,
+        "api_key": "",
+        "status_only": true
+      }
+    }
+  }
 }
 ```
 
@@ -170,6 +199,10 @@ Start-Sleep -Seconds 180   # Windows PowerShell
 | `commentary_style` | string | `"events_only"` | `"events_only"` / `"play_by_play"` | 播报风格。`events_only` = 仅在比分变化或出现进球/犯规等重大事件时推送（当前默认行为）。`play_by_play` = 文字直播模式——像文字解说员一样每轮推送比赛进程，即使比分未变也有叙述更新；LLM 提取更细粒度的事件类型（射门/扑救/角球等），且每轮至少产一条 `commentary` 类型事件描述当前局势。详见 §Stage B LLM prompt 变体 与 §render_live 3×2 状态表。 |
 | `play_by_play_default_poll_interval_seconds` | integer | 90 | ≥ 60 | 文字直播模式推荐的轮询间隔（秒）。当 `commentary_style == "play_by_play"` 且用户未自定义 `poll_interval_seconds`（仍为默认值 180）时，自动使用此值代替，使文字直播更「实时」。用户显式设置了非 180 的 `poll_interval_seconds` 时，以用户设置为准。 |
 | `search_freshness_boost` | boolean | `true` | `true` / `false` | 是否启用 Stage A+ Fallback（实时源精准搜索）。`true`（默认）：当 Stage A 主搜索没找到文字直播 URL 时，自动用 `site:` 限定搜索精准定位中文实时源（虎扑/新浪），大幅减少「进球后长时间检测不到」的问题。`false`：关闭此 fallback，回到旧行为（Stage A 嗅探不到 URL 时直接 `events=[]`）。详见 §build_pbp_search_query 与 FAQ Q1。 |
+| `providers.football.priority` | array&lt;string&gt; | 见示例 | provider 名称列表 | 足球数据源优先级。建议按 `sportradar_extended` → `sportmonks` / `api_football` → `football_data_org` → `web` 排序；所有 API provider 都不可用时必须回退到 `web_search` / `webfetch` 旧路径。 |
+| `providers.football.*.enabled` | boolean | `false` | `true` / `false` | 是否启用对应足球 API provider。默认全部关闭；只有显式设为 `true` 且配置了可用 `api_key` 时才允许尝试该 provider。 |
+| `providers.football.*.api_key` | string | `""` | — | 对应 provider 的 API key。留空时视为未配置，Agent 必须跳过该 provider 并继续尝试下一优先级或最终回退到 `web`。 |
+| `providers.football.football_data_org.status_only` | boolean | `true` | `true` / `false` | 是否仅使用 football-data.org 做比赛状态校准。建议保持 `true`，用于区分 `PAUSED` / `FINISHED` 等状态，避免把中场休息误判为完场。 |
 
 > **⚠ 配置键命名警告（重申已有规则）**：上表所有「真实键」**绝不**以下划线 `_` 开头；只有 `_comment_*` 形态的注释兄弟键才会被 `strip_comment_keys` 剥离（见 §read_config）。把真实键写成 `_include_events` / `_max_events_per_msg` 之类**会被静默剥离**——配置看起来填了但运行时全是默认值，极难排查。`include_events` / `max_events_per_msg` / `commentary_dedup_window` / `commentary_style` / `play_by_play_default_poll_interval_seconds` / `search_freshness_boost` 所有真实配置键**必须**按本表的字面量拼写出现在 `config.json` 顶层。
 
