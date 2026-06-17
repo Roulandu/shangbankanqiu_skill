@@ -205,7 +205,7 @@ cp config.example.json config.json
 ## 常见问题
 
 **Q: 需要 API Key 吗？**
-A: 不需要。Skill 利用 AI Agent 自带的 web search 能力搜索比赛数据，不需要任何第三方 API。
+A: 默认不需要。Skill 会使用 AI Agent 自带的 web search 能力搜索比赛数据；只有启用可选足球 API provider 时，才需要对应 provider 的 API key。
 
 **Q: 支持哪些 AI Agent 平台？**
 A: OpenCode、Claude Code、Codex、Cursor、OpenClaw、Trae 等所有支持 SKILL.md 规范的平台。
