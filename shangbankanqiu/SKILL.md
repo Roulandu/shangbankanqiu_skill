@@ -729,7 +729,7 @@ Normalized match snapshot（所有 provider / web fallback 输出都必须归一
   "score": "1-0",
   "phase": "2H",
   "phase_keywords": ["Live", "2H", "进行中"],
-  "football_status": "IN_PLAY",
+  "football_status": "SECOND_HALF",
   "minute": "64",
   "possession": {"home": 53, "away": 47},
   "events": [],
@@ -740,7 +740,7 @@ Normalized match snapshot（所有 provider / web fallback 输出都必须归一
 ```
 
 字段约定：
-- `football_status` 是 provider 原始/归一化足球状态的承载位，供后续 `classify_state / football_status_machine` 参考；本节只定义数据流，不展开 Task 3 的状态机细节。
+- `football_status` 在 provider adapter 输入边界可承载 provider-native 原始状态（如 `IN_PLAY` / `PAUSED` / `HT` / `FINISHED`），但进入 `classify_state` 前必须经 `normalize_football_status(match)` 归一；归一化输出只允许使用 §football_status_machine 的机器状态（如 `SECOND_HALF` / `HALFTIME` / `FINISHED`），绝不返回 `IN_PLAY`。
 - `source` / `capabilities` 应由 provider 或 `decorate_web_snapshot` 设置；`source_freshness_seconds` 表示 provider 数据相对当前轮询时刻的估计新鲜度，未知时可省略或为 `null`。
 - `events` 使用 §parse_search_result event schema；provider 没有事件能力时填 `[]`，不要阻塞 Stage B。
 - `capabilities` 只声明本次 snapshot 实际可用能力，不要把 provider 理论能力硬塞进去。
@@ -867,7 +867,7 @@ def decorate_web_snapshot(matches):
 }
 ```
 
-字段规则：`football_status` 的合法值由 §football_status_machine 定义；非足球比赛可以省略或留空。足球的 `HALFTIME` / `SUSPENDED` / `UNKNOWN_LIVE` 都属于 live polling 状态，**永不触发 final**。
+字段规则：`football_status` 在输入侧可为空、可省略，也可暂存 provider-native 原始状态（如 `IN_PLAY` / `PAUSED` / `HT` / `FINISHED`）；`normalize_football_status(match)` 的归一化输出合法值由 §football_status_machine 定义。足球的 `HALFTIME` / `SUSPENDED` / `UNKNOWN_LIVE` 都属于 live polling 状态，**永不触发 final**。
 
 **`events` 字段说明** (schema field name = `events:` array of event dicts)：
 
@@ -1500,6 +1500,8 @@ normalize_football_status(match):
         return "PENALTY_SHOOTOUT"
     if text contains any of {"SUSPENDED", "Suspended", "中断"}:
         return "SUSPENDED"
+    if text contains any of {"IN_PLAY", "INPLAY", "LIVE"}:
+        return "UNKNOWN_LIVE"
     if text contains any of {"Live", "直播中", "进行中"} or match.get("minute"):
         return "UNKNOWN_LIVE"
     if text contains any of {"FINISHED", "FT", "Full-Time", "AET", "AP"}:
