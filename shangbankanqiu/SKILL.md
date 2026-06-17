@@ -860,7 +860,7 @@ def decorate_web_snapshot(matches):
       "id_hash": "<sha1((match_key + '|' + ts + '|' + text).encode('utf-8'))[:12]>",  # 去重键，REQUIRED；算法见下方（必须 byte-equal Stage B）
       "ts":      "21'" | "Q3 4:32" | "HT" | "",         # 比赛时钟字符串，REQUIRED（可为 ""）
       "team":    "home" | "away" | "",                  # 归属队；中性事件留 ""
-      "type":    "goal" | "foul" | "sub" | "card" | "key_play" | "other" | "shot" | "save" | "corner" | "free_kick" | "timeout" | "turnover" | "rebound" | "commentary",   # 14 个枚举；后 8 个仅 commentary_style="play_by_play" 时使用（与 §llm_extract_events VALID_TYPES byte-equal）
+      "type":    "goal" | "foul" | "sub" | "card" | "key_play" | "other" | "shot" | "save" | "corner" | "free_kick" | "timeout" | "turnover" | "rebound" | "commentary" | "pass" | "long_ball" | "dribble" | "interception" | "clearance" | "cross" | "duel" | "offside" | "possession",   # 23 个枚举；后 17 个仅 commentary_style="play_by_play" 时使用（与 §llm_extract_events VALID_TYPES byte-equal）
       "text":    "≤80 个中文字符的单行描述"
     }
   ]
@@ -877,7 +877,7 @@ def decorate_web_snapshot(matches):
   - `id_hash`：长度恰好 12 的十六进制字符串，跨轮去重的唯一键，必填。
   - `ts`：游戏内时钟字符串，**保留原始风格**——足球用 `"21'"` / `"45+2'"` / `"HT"`；篮球用 `"Q3 4:32"` / `"OT 1:05"`；无法获取时填 `""`。必填字段，但允许 `""`。`commentary` 类型事件**允许 `ts` 为 `""`**（叙述性事件不总是有精确时钟，此时 `id_hash` 仍由 `match_key + "|" + "" + "|" + text` 计算）。
   - `team`：`"home"` / `"away"` 之一；裁判/中立事件填 `""`。
-  - `type`：枚举值之一；不在枚举内的杂项一律归到 `"other"`，不要新造字符串。当 `commentary_style == "events_only"` 时仅使用前 6 个类型（goal/foul/sub/card/key_play/other）；当 `commentary_style == "play_by_play"` 时可使用全部 14 个类型。各扩展类型含义：
+  - `type`：枚举值之一；不在枚举内的杂项一律归到 `"other"`，不要新造字符串。当 `commentary_style == "events_only"` 时仅使用前 6 个类型（goal/foul/sub/card/key_play/other）；当 `commentary_style == "play_by_play"` 时可使用全部 23 个类型。足球细粒度动作类型（`pass` / `long_ball` / `dribble` / `interception` / `clearance` / `cross` / `duel` / `offside` / `possession`）只能在 provider `extended_timeline` 或原始文字直播明确支持时使用；不要仅凭比分/控球率/射门统计编造具体球员动作。各扩展类型含义：
     - `shot`：射门 / 投篮未中（球权未转化为得分）
     - `save`：扑救 / 封盖（守门员扑出 / 篮球盖帽）
     - `corner`：角球
@@ -886,6 +886,15 @@ def decorate_web_snapshot(matches):
     - `turnover`：失误 / 丢球权（传球失误、被抢断等）
     - `rebound`：篮板球
     - `commentary`：文字解说叙述行——当无具体技术事件但需描述比赛节奏/局势时使用（如「双方中场争夺激烈，均无威胁进攻」）。这是 `play_by_play` 模式的**兜底类型**，保证每轮至少有一条输出。
+    - `pass`：足球传球（play_by_play only；必须有来源明确写出传球者/传球动作）
+    - `long_ball`：足球长传 / 长球转移（play_by_play only；必须有来源明确支持）
+    - `dribble`：足球带球推进 / 过人（play_by_play only；必须有来源明确支持）
+    - `interception`：足球拦截 / 抢断（play_by_play only；必须有来源明确支持）
+    - `clearance`：足球解围（play_by_play only；必须有来源明确支持）
+    - `cross`：足球传中（play_by_play only；必须有来源明确支持）
+    - `duel`：足球对抗 / 争顶 / 拼抢（play_by_play only；必须有来源明确支持）
+    - `offside`：足球越位（play_by_play only；必须有来源明确支持）
+    - `possession`：足球控球局势 / 球权阶段（play_by_play only；可由可见控球数据或明确文字直播支持，但不得虚构具体传球线路）
   - `text`：单行中文描述，长度 ≤ 80 个字符（按字符数算，不是字节数）；不要含换行/Markdown。
 
 **`id_hash` 计算规则（必须严格按此实现，4 家 Agent 一致）**：
@@ -1235,11 +1244,11 @@ def llm_extract_events(page_md, match_key, schema):
     # HARD CONTRACT: 4 家 Agent 不许改字符（与 events_only prompt 同等约束）
     prompt_play_by_play = """你是一个体育赛事文字直播解说员。下面是一段 markdown 格式的比赛文字直播页面。
 
-请按时间倒序扫描，提取**所有**最近发生的比赛进程——不仅仅是进球/犯规等重大事件，还包括射门、扑救、角球、暂停、失误等常规动作，以及比赛节奏/局势的叙述。每条事件必须包含 5 个字段：
+请按时间倒序扫描，提取**所有**最近发生的比赛进程——不仅仅是进球/犯规等重大事件，还包括射门、扑救、角球、暂停、失误、足球传球/长传/盘带/拦截/解围/传中/对抗/越位/控球等常规动作，以及比赛节奏/局势的叙述。每条事件必须包含 5 个字段：
 
 - ts:   比赛内时钟字符串。NBA 用 "Q1-11:45" / "Q4-02:13" / "OT-04:00"；足球用 "12'" / "45+2'" / "67'"；其他用页面原始时钟字符串。
 - team: 事件归属方。明确属于主队填 "home"，客队填 "away"，无法判定填 null。**不要瞎猜**——宁可填 null。
-- type: 必须是以下 14 个枚举值之一：
+- type: 必须是以下 23 个枚举值之一：
         - goal      (进球 / 得分 / 投篮命中 / 三分球 / 点球命中)
         - foul      (犯规 / 违例)
         - sub       (换人)
@@ -1253,9 +1262,26 @@ def llm_extract_events(page_md, match_key, schema):
         - turnover  (失误 / 丢球权 / 被抢断)
         - rebound   (篮板球)
         - commentary (文字解说叙述行——用于描述比赛节奏/局势/无具体技术事件时的状况)
+        - pass      (足球传球；仅当来源明确给出传球动作)
+        - long_ball (足球长传 / 长球转移；仅当来源明确支持)
+        - dribble   (足球带球推进 / 过人；仅当来源明确支持)
+        - interception (足球拦截 / 抢断；仅当来源明确支持)
+        - clearance (足球解围；仅当来源明确支持)
+        - cross     (足球传中；仅当来源明确支持)
+        - duel      (足球对抗 / 争顶 / 拼抢；仅当来源明确支持)
+        - offside   (足球越位；仅当来源明确支持)
+        - possession (足球控球局势 / 球权阶段；可由可见控球数据或明确文字直播支持)
         - other     (其他不便归类的)
 - text: 一行人类可读描述，必须 ≤ 80 个字符。中文优先。风格要求：**像文字解说员一样叙述**，例：「詹姆斯突破上篮被戴维斯封盖」「中场争夺激烈，双方均无威胁进攻」。不要只写冰冷的技术统计——要有画面感。
 - id_hash: 留空字符串 ""，由调用方计算填入，**LLM 不要算**。
+
+## 证据约束
+
+- 只有当 `page_md` / provider event 明确给出球员 + 动作时，才写谁带球、谁传球、谁长传、谁拦截、谁解围。
+- 如果页面只有比分、控球率、射门数等统计，不要编造球员动作；写局势描述。
+- commentary 兜底必须基于可见证据：比分、比赛阶段、最近事件、统计趋势。可以写「双方中场争夺增加」；不得写不存在的传球线路、传球目标、长传路线或拦截者。
+- 若没有 extended timeline / 原始文字直播支持细节，兜底行不得包含具体球员名、传球目标、长传路线、拦截者。
+- 本轮数据源没有提供具体传球时，不要为了画面感补写「某球员直塞」「边路起球」「后腰长传找前锋」等细节。
 
 ⚠ 重要：如果页面中近期无任何具体技术事件（无射门/犯规/换人等），你**必须**至少输出 1 条 type="commentary" 的事件来描述当前比赛状态，例：「比赛进行到第65分钟，双方中场争夺，均无威胁进攻」或「第二节中段，双方陷入拉锯战」。**绝不**输出空数组 `[]`——除非页面是空壳或比赛未开始。
 
@@ -1321,7 +1347,9 @@ def llm_extract_events(page_md, match_key, schema):
     VALID_TYPES_EVENTS_ONLY = {"goal", "foul", "sub", "card", "key_play", "other"}
     VALID_TYPES_PLAY_BY_PLAY = {"goal", "foul", "sub", "card", "key_play", "other",
                                 "shot", "save", "corner", "free_kick",
-                                "timeout", "turnover", "rebound", "commentary"}
+                                "timeout", "turnover", "rebound", "commentary",
+                                "pass", "long_ball", "dribble", "interception",
+                                "clearance", "cross", "duel", "offside", "possession"}
     # IMPORTANT: commentary_style comes from config read at startup (§read_config).
     # llm_extract_events reads config.commentary_style directly to select VALID_TYPES,
     # hard_cap, and commentary fallback behavior. config is assumed to be in scope
@@ -1359,11 +1387,12 @@ def llm_extract_events(page_md, match_key, schema):
             "text":    text,
         })
 
-    # 6. play_by_play commentary fallback：保证文字直播模式每轮至少有 1 条叙述
+    # 6. play_by_play commentary fallback：保证文字直播模式每轮至少有 1 条局势描述
     #    若 LLM 未产出任何事件（返回空数组或全部被校验丢弃），注入一条合成 commentary。
-    #    这是「文字直播每轮必推」承诺的兜底——纯靠 prompt 指令不够（LLM 可能不遵守）。
+    #    兜底必须基于可见证据（比分、phase、最近事件、统计趋势），不得虚构具体球员名、
+    #    传球目标、长传路线或拦截者；没有 extended_timeline / 原始文字直播支持时只写局势。
     if config.get("commentary_style", "events_only") == "play_by_play" and len(cleaned) == 0:
-        fallback_text = "比赛进行中，暂无详细事件数据"
+        fallback_text = "本轮数据源没有提供具体传球或技术动作，按比分和阶段更新局势描述"
         fallback_hash = sha1((match_key + "|" + "" + "|" + fallback_text).encode("utf-8")).hexdigest()[:12]
         cleaned.append({
             "id_hash": fallback_hash,
@@ -1685,10 +1714,16 @@ return ok
 | events_only | Unchanged | 0 | **SKIP** | — (返回字符串字面量 `"SKIP"`) |
 | play_by_play | Changed | 任意 (≥0) | regular push | (沿用原前缀) |
 | play_by_play | Unchanged | ≥1 | commentary push | `🎤 文字直播 · 📋 N 条新动态` (N = 本轮新事件总数) |
-| play_by_play | Unchanged | 0 | **always-push** | `🎤 文字直播 · ⏱️ 比分暂无变化` |
+| play_by_play | Unchanged | 0 | **always-push** | `🎤 文字直播 · 📝 局势描述` |
 
 > 注：本表只覆盖「正在直播」分支下的实时推送；未开始 / 已完结由 `render_preview` / `render_final` 处理，不进本函数。
-> play_by_play 模式下**永不 SKIP**——即使比分未变且无新事件，仍推送当前比分/阶段作为"持续在线"信号。这正是用户选择文字直播模式的预期。
+> play_by_play 模式下**永不 SKIP**——即使比分未变且无新事件，仍推送基于可见证据的局势描述作为"持续在线"信号。这正是用户选择文字直播模式的预期。
+> 局势描述模板必须按证据选择：
+> - HALFTIME：`🎤 文字直播 · 📝 局势描述\n中场休息，当前比分 {score}。上半场数据源未提供更多具体动作，等待下半场恢复。`
+> - live with recent events：`🎤 文字直播 · 📝 局势描述\n比赛进行到 {phase}，比分 {score}。结合最近 {event_summary}，场面仍在推进。`
+> - score-only：`🎤 文字直播 · 📝 局势描述\n比赛进行到 {phase}，当前比分 {score}。本轮数据源没有提供具体传球或技术动作，仅按比分和阶段更新。`
+>
+> 若没有 extended timeline / 原始文字直播支持细节，fallback 行不得包含具体球员名、传球目标、长传路线或拦截者。
 
 ##### 分支伪代码（commentary_style-aware 决策树）
 
@@ -1729,7 +1764,8 @@ def render_live(fresh, last_pushed_score, score_snapshot, config):
             msg.body = "🎤 文字直播 · 📋 " + str(new_events_count) + " 条新动态\n" + msg.body
             return msg
         # score unchanged + no new events → still push (play_by_play never skips)
-        msg.body = "🎤 文字直播 · ⏱️ 比分暂无变化\n" + msg.body
+        # Fallback should be a source-grounded 局势描述, not only "比分暂无变化".
+        msg.body = "🎤 文字直播 · 📝 局势描述\n" + msg.body
         return msg
 ```
 
@@ -1740,7 +1776,7 @@ def render_live(fresh, last_pushed_score, score_snapshot, config):
 ##### `"SKIP"` 哨兵契约
 
 - 当 `render_live` 判定「比分未变 且 无新事件」且 `commentary_style == "events_only"` 时，**必须**返回字面量字符串 `"SKIP"`（而不是返回 None / 抛异常 / 返回空 msg）。
-- 当 `commentary_style == "play_by_play"` 时，**永不返回 `"SKIP"`**——即使比分未变且无新事件，仍返回 msg 对象（body 前缀加 `🎤 文字直播 · ⏱️ 比分暂无变化`）。
+- 当 `commentary_style == "play_by_play"` 时，**永不返回 `"SKIP"`**——即使比分未变且无新事件，仍返回 msg 对象（body 前缀加 `🎤 文字直播 · 📝 局势描述`，内容只能基于比分、阶段、最近事件、统计趋势等可见证据）。
 - 主循环（§主流程伪代码 第 2 步 RENDER 之后）**必须**在调用 `sign_and_post` 之前显式判定 `if msg == "SKIP": continue`，跳过 PERSIST 与 POST，直接进入下一个 sleep 切片。
 - 该哨兵保证了 `events_only` 模式下「无变化无事件」时**不发空消息打扰群成员**，同时让 push gate 决策仍然集中在 `render_live`，而不是散落在主循环里。
 
@@ -1838,9 +1874,18 @@ return msg
 | `timeout` | ⏸️ | 暂停（play_by_play only；篮球暂停 / 足球医疗暂停等） |
 | `turnover` | ❌ | 失误 / 丢球权（play_by_play only；传球失误、被抢断等） |
 | `rebound` | 🔁 | 篮板球（play_by_play only） |
+| `pass` | ↗️ | 足球传球（football play_by_play only；必须有来源明确写出传球动作，不得从控球率推断） |
+| `long_ball` | 🚀 | 足球长传 / 长球转移（football play_by_play only；必须有 extended timeline 或原始文字直播支持） |
+| `dribble` | 🌀 | 足球带球推进 / 过人（football play_by_play only；必须有来源明确支持） |
+| `interception` | 🛡️ | 足球拦截 / 抢断（football play_by_play only；必须有来源明确支持） |
+| `clearance` | 🧹 | 足球解围（football play_by_play only；必须有来源明确支持） |
+| `cross` | 📤 | 足球传中（football play_by_play only；必须有来源明确支持） |
+| `duel` | ⚔️ | 足球对抗 / 争顶 / 拼抢（football play_by_play only；必须有来源明确支持） |
+| `offside` | 🚩 | 足球越位（football play_by_play only；必须有来源明确支持） |
+| `possession` | 🔄 | 足球控球局势 / 球权阶段（football play_by_play only；可由可见控球数据或明确文字直播支持，不得虚构线路） |
 | `commentary` | 📝 | 文字解说叙述行（play_by_play only；兜底类型——当无具体技术事件时描述比赛节奏/局势） |
 
-> 实现注：`goal` 行展示时由渲染器根据 `match_type`（或 `match.home` / `match.away` 联赛上下文）二选一；其余 emoji 跨赛事一致。`match_type` 是主循环启动时由用户选择（"世界杯" / "NBA"）的变量（见 §主流程伪代码 `match_type = ask_user_if_missing(...)`），不在 `parse_search_result` 输出的 match dict 中。渲染器通过与 `config` 同样的方式访问 `match_type`（模块级 / 闭包变量；`render_feishu_card(msg, config)` / `render_dingtalk_md(msg, config)` 所在作用域应能访问 `match_type`）。若无法访问 `match_type`，可通过队名上下文推断（含 "Lakers"/"Celtics" 等 NBA 队名 → 篮球 🏀；其余 → 足球 ⚽）。标注 "play_by_play only" 的 8 个类型在 `events_only` 模式下不会出现（验证阶段会映射到 `other`），渲染器不需要为 `events_only` 模式处理这些 emoji。`commentary` 类型在 `play_by_play` 模式下是**兜底类型**——当无具体技术事件时，LLM 仍会产出一行 `commentary` 描述当前比赛节奏/局势，保证每次轮询都有推送内容。
+> 实现注：`goal` 行展示时由渲染器根据 `match_type`（或 `match.home` / `match.away` 联赛上下文）二选一；其余 emoji 跨赛事一致。`match_type` 是主循环启动时由用户选择（"世界杯" / "NBA"）的变量（见 §主流程伪代码 `match_type = ask_user_if_missing(...)`），不在 `parse_search_result` 输出的 match dict 中。渲染器通过与 `config` 同样的方式访问 `match_type`（模块级 / 闭包变量；`render_feishu_card(msg, config)` / `render_dingtalk_md(msg, config)` 所在作用域应能访问 `match_type`）。若无法访问 `match_type`，可通过队名上下文推断（含 "Lakers"/"Celtics" 等 NBA 队名 → 篮球 🏀；其余 → 足球 ⚽）。标注 "play_by_play only" 的 17 个类型在 `events_only` 模式下不会出现（验证阶段会映射到 `other`），渲染器不需要为 `events_only` 模式处理这些 emoji。足球细粒度类型还必须有 extended timeline 或原始文字直播支持；无证据时用 `commentary` 写局势。`commentary` 类型在 `play_by_play` 模式下是**兜底类型**——当无具体技术事件时，LLM 仍会产出一行 `commentary` 描述当前比赛节奏/局势，保证每次轮询都有推送内容。
 
 **`render_feishu_card(msg, config)`** → 按 §飞书消息格式 组装为「N 元素」卡片（N ∈ {3, 4}）：
 
@@ -2358,7 +2403,7 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
 
 **比分未变、无新事件时的文字直播推送**（3 元素布局——事件 div 省略）:
 
-当 `commentary_style="play_by_play"` 且本轮无新事件（LLM 也未返回任何事件）时，飞书卡片退化为 3 元素（比分 div + hr + note），body 前缀为 `🎤 文字直播 · ⏱️ 比分暂无变化`。
+当 `commentary_style="play_by_play"` 且本轮无新事件（LLM 也未返回任何事件）时，飞书卡片退化为 3 元素（比分 div + hr + note），body 前缀为 `🎤 文字直播 · 📝 局势描述`。正文只能基于可见证据生成；若无 extended timeline / 原始文字直播支持，不得出现具体球员名、传球目标、长传路线或拦截者。
 
 ```json
 {
@@ -2373,7 +2418,7 @@ sign = Base64(HMAC-SHA256(timestamp + "\n" + secret, secret))
         "tag": "div",
         "text": {
           "tag": "lark_md",
-          "content": "🎤 文字直播 · ⏱️ 比分暂无变化\n\n**阿根廷 vs 法国**\n🕐 下半场 85'\n\n📊 **当前比分**: 阿根廷 2 - 1 法国"
+          "content": "🎤 文字直播 · 📝 局势描述\n\n**阿根廷 vs 法国**\n🕐 下半场 85'\n\n📊 **当前比分**: 阿根廷 2 - 1 法国\n\n本轮数据源没有提供具体传球或技术动作，仅按比分和阶段更新。"
         }
       },
       { "tag": "hr" },
