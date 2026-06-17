@@ -137,9 +137,11 @@ cp config.example.json config.json
 
 至少配置飞书或钉钉中的一个。
 
-### 可选：足球 API 数据源
+## 足球实时性增强
 
-足球比赛可以选择配置第三方 API provider，但这不是必需项。所有 provider 默认关闭；如果没有启用 provider，或没有填写可用的 API key，Skill 会自动沿用 `web_search` / `webfetch` 旧路径抓取比分和文字直播信息。
+世界杯足球支持可选 football API provider，但这不是必需项。所有 provider 默认关闭；如果没有启用 provider，或没有填写可用的 API key，Skill 会自动沿用 `web_search` / `webfetch` 旧路径抓取比分和文字直播信息。
+
+配置 API key 后，Agent 会先尝试结构化数据源，再回到原有 web 搜索路径，以优先获取实时比分、半场状态、关键事件和更细的比赛动作。
 
 推荐优先级：
 
@@ -147,6 +149,14 @@ cp config.example.json config.json
 2. `sportmonks` / `api_football`：用于实时比分、状态、事件、统计和文字解说。
 3. `football_data_org`：用于 `PAUSED` / `FINISHED` 状态校准，避免把中场休息误判为完场。
 4. `web`：作为最终 fallback。
+
+行为保证：
+
+- 没有 API key：使用现有 `web_search` / `webfetch` 路径。
+- API 失败或触发 rate limit：给出 warning，并回退到下一个 provider 或 `web`。
+- `HT` / `PAUSED` / `中场`：继续轮询，不发送最终总结。
+- `FINISHED` / `FT` / `Full-Time`：发送最终总结并清理状态。
+- 只有来源支持具体球员动作时，才播报“谁持球推进、长传找谁、谁解围”等细节；否则只播报局势，不编传球路线。
 
 ## ⚠ 设计原则：本 Skill 不会后台化
 
