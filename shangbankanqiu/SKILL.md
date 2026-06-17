@@ -381,13 +381,14 @@ while poll_idx < config.max_polls:
             m["events"] = []                              # include_events=false → 退化成纯比分模式
 
     # ---- 第 1.7 步: SCORE-CHANGE EVENT SYNTHESIS（比分变化事件合成） ----
-    # 当 Stage B 完全失败（events=[]）但比分发生变化时，合成进球事件。
+    # 当比分发生变化且 events 中没有现成 goal 事件时，补充合成进球事件。
     # 这是最后一道防线——即使搜索延迟、URL 缺失、webfetch 超时，只要比分变了，
     # 用户一定能看到一条「某队进球」的推送，而不是干巴巴的「比分 0-0 → 1-0」。
     #
     # CRITICAL RULE #7 补充：events 不进 snapshot/dedup 是对的。但合成事件是独立的——
     # 它们有专门的 id_hash 前缀 "syn:" ，不会与 Stage B 的真实事件冲突。
-    # 合成事件只在 events=[] 且比分变化时才产生；Stage B 正常工作时不会触发。
+    # 合成事件只补缺 goal；必须保留 provider / Stage B 已有的非 goal 事件。
+    # merge_events_by_id 保留同一 id_hash 的首次出现，丢弃后续重复 id。
     if last_pushed_score is not None and config.include_events:
         # 将 last_pushed_score（list of {home, away, score, phase}）转为 match_key → score dict
         # 便于按 match_key 查找旧比分。last_pushed_score 来自 extract_score_snapshot，
@@ -450,7 +451,7 @@ while poll_idx < config.max_polls:
                         "text":    m.get("away", "") + " 进球！比分 " + new_score_raw,
                     })
             if syn_events:
-                m["events"] = syn_events
+                m["events"] = merge_events_by_id(m.get("events", []) + syn_events)
 
     # ---- 第 2 步: RENDER + PUSH GATE ----
     state          = classify_state(fresh)                # 每轮都要重判，状态会变化（直播→完结）
@@ -811,21 +812,21 @@ def decorate_web_snapshot(matches):
 
 #### Score-Change Event Synthesis（比分变化事件合成）
 
-**设计动机**：即使启用了 Stage A+ Fallback，仍然可能出现 Stage B 完全失败的场景（webfetch 超时、反爬挡掉、页面 JS-only 拿不到事件等）。此时 `events=[]`，但比分已经从 0-0 变成 1-0——用户明明知道有进球，却只看到一条干巴巴的「比分 0-0 → 1-0」推送，没有任何进球事件。
+**设计动机**：即使启用了 Stage A+ Fallback，仍然可能出现 Stage B 没抓到进球事件的场景（webfetch 超时、反爬挡掉、页面 JS-only 拿不到事件，或 provider 只给了非进球 commentary 等）。此时比分已经从 0-0 变成 1-0——用户明明知道有进球，却只看到一条干巴巴的「比分 0-0 → 1-0」推送，没有任何进球事件。
 
-**解决方案**：在主循环 §第 1.7 步，当 `events=[]` 且比分发生变化时，自动合成进球事件。这是最后一道防线——确保即使所有搜索和抓取都失败，用户仍能看到一条「某队进球！」的推送。
+**解决方案**：在主循环 §第 1.7 步，当比分发生变化且当前 events 中没有 existing goal 时，自动合成缺失的进球事件，并保留 provider / Stage B 已有的 non-goal events。这是最后一道防线——确保即使所有搜索和抓取都没给出 goal，用户仍能看到一条「某队进球！」的推送。
 
 **合成规则**：
 
-1. **触发条件**：`m["events"] == []`（Stage B 完全失败/未执行）**且** 该场比赛比分发生变化（通过对比 `last_pushed_score` 与当前 `score`）
+1. **触发条件**：该场比赛比分发生变化（通过对比 `last_pushed_score` 与当前 `score`）**且** `m.get("events", [])` 中 no existing goal（没有 `type="goal"` 的事件）
 2. **合成内容**：根据比分差值生成进球事件。例如比分从 0-0 变成 1-0 → 合成 1 条 `type="goal"` 事件；0-0 变成 2-1 → 合成 3 条事件（2 条主队进球 + 1 条客队进球）
 3. **`id_hash` 前缀**：合成事件使用 `"syn:"` 前缀（10 字符），与 Stage B 的真实事件（sha1[:12]）无冲突风险。格式：`"syn:" + sha1((match_key + "|" + score + "|" + team_side + "_goal"))[:10]`
 4. **`text` 模板**：`"{队名} 进球！比分 {新比分}"`——简洁但信息充分
 5. **`ts` 为空**：合成事件没有精确时间戳（我们只知道"这一轮比分变了"，不知道进球发生的精确时刻）
-6. **不去重 Stage B 的真实事件**：如果 Stage B 在下一轮成功抓到真实进球事件（有精确 ts 和详细描述），该真实事件的 `id_hash` 与合成事件不同，不会被 `seen_event_ids` 误去重。用户可能看到同一次进球的两条推送（合成 → 真实），但这是可接受的——宁可多推一条，不可漏推。
+6. **合并而不覆盖**：`m["events"] = merge_events_by_id(m.get("events", []) + syn_events)`；`merge_events_by_id` 保留同一 `id_hash` 的首次出现，丢弃后续重复 id，确保 provider / Stage B non-goal events 不被合成进球覆盖。
 
 **不触发的场景**：
-- Stage B 返回了真实事件（`len(m["events"]) > 0`）→ 不需要合成
+- 已有 `type="goal"` 的真实事件 → 不需要合成
 - `include_events=false` → 整段合成跳过
 - 比分未变化 → 不合成
 - 首轮（`last_pushed_score is None`）→ 无旧比分可对比，不合成
