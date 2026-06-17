@@ -556,7 +556,11 @@ while poll_idx < config.max_polls:
             persisted["seen_event_ids"] = persisted["seen_event_ids"][-cap_ring:]
         # 4c. 整体写盘（score + ts + seen_event_ids + pbp_urls 一次性原子持久化）
         persisted["score"] = score_snapshot
+        persisted["provider_cache"] = extract_provider_cache(fresh)
         persisted["ts"]    = now()
+        # extract_provider_cache(fresh) saves only diagnostics fields
+        # (last_source, football_status, source_freshness_seconds, capabilities);
+        # 不得把 fresh.events 写入 score_snapshot，且 provider_cache must not affect scores_equal.
         # pbp_urls 已在 §第 1.5 步中发现时即时写入 persisted dict，
         # 这里随整体写盘一起持久化到磁盘。
         write_state_file_safely(state_path, persisted)
@@ -808,6 +812,14 @@ def decorate_web_snapshot(matches):
         # source_freshness_seconds is optional/sparse for web; only set it if known.
     return matches
 ```
+
+##### Multi-source merge rules
+
+- Status: highest-priority structured provider wins; low-confidence FINISHED cannot override higher-confidence HALFTIME/live unless multi-source final confirmation.
+- Score: higher priority and lower source_freshness_seconds wins; conflicts log warning and continue polling.
+- Events: dedupe by `match_key + minute/ts + type + team/player + normalized_text`.
+- Fine-grained actions only retained when extended_timeline or original commentary supports them.
+- `football_data_org.status_only=true` reads status only and does not merge events.
 
 `fetch_provider_once` / `normalize_provider_response` 是 host-agent protocol steps，而不是 SDK 要求：Agent 可以用自身可用的 HTTP/webfetch/shell 网络能力短超时调用 provider，也可以在宿主不支持直接 API 调用时直接跳过 provider。每次 provider 尝试都必须短 timeout、无副作用、失败不抛出到主循环；只有最终 `web` fallback 仍失败时，才进入主流程已有的连续失败计数。
 
@@ -1599,12 +1611,22 @@ except (parse error / IO error):
 
 ```text
 {
-  "score":           <score_snapshot>,                 # 见 §extract_score_snapshot；用于比分去重
-  "ts":              "<ISO 8601 字符串或 unix 时间戳>",  # 写入时刻，便于排查
-  "seen_event_ids":  ["<id_hash>", "<id_hash>", ...],  # 已推送过的事件去重环形缓冲区
-  "pbp_urls":        {"<match_key>": "<url>", ...}     # 已发现的文字直播 URL 缓存（跨轮复用）
+  "score": "<score_snapshot>",
+  "last_push_ts": "2026-06-17T20:00:00+08:00",
+  "seen_event_ids": ["..."],
+  "pbp_urls": {"<match_key>": "<url>"},
+  "provider_cache": {
+    "<match_key>": {
+      "last_source": "sportmonks",
+      "football_status": "HALFTIME",
+      "source_freshness_seconds": 18,
+      "capabilities": ["score_status", "events", "commentary"]
+    }
+  }
 }
 ```
+
+`provider_cache` is optional. It records the recent successful provider, normalized football status, source freshness, and capabilities for logs/diagnostics/provider hints only, and does not enter `scores_equal`.
 
 **`seen_event_ids` 字段**：
 
