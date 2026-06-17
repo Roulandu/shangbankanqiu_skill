@@ -2252,7 +2252,7 @@ Agent: [read config.json] → [web_search "NBA 比分 直播 NBA live scores tod
        → 检测到 2 场进行中
        → [render_live + sign_and_post] (一条消息汇总两场)
        → [Start-Sleep -Seconds 180] ← Windows PowerShell 同步阻塞
-       → 醒来 → [football provider if enabled/configured, else web_search] → [Stage A+ fallback if needed] → [post] → [sleep] → ... 循环
+       → 醒来 → [web_search] → [Stage A+ fallback if needed] → [post] → [sleep] → ... 循环
 
 用户: 世界杯有比赛吗
 Agent: [read config.json] → [web_search "世界杯 比分 直播 FIFA World Cup live scores today"]
