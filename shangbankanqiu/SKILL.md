@@ -1542,7 +1542,7 @@ return "未开始"
 
 歧义时**优先视为正在直播**（误轮询比误退出代价更低）。
 
-> **⚠ 非回归约束（NON-REGRESSION，CRITICAL）**：events MUST NOT influence state classification — state is determined SOLELY by `phase_keywords` / `phase`. 新增的 `events` 字段仅供 rendering 与 dedup 使用，**不参与**状态判定。即「事件不影响状态」：哪怕一场比赛抓到再多 goal/foul/sub 事件，只要 `phase_keywords` 没命中 Live/Final 关键词，`classify_state` 就**绝不**因 events 改变返回值。这条规则确保事件流是 Stage A 状态判定的下游旁路、而不是新数据源（详见 §extract_score_snapshot 排除列表与 §Hard constraints / break-risks）。
+> **⚠ 非回归约束（NON-REGRESSION，CRITICAL）**：events MUST NOT influence state classification. 足球状态先由 §football_status_machine 判定，可使用 `football_status` / `minute` / `phase_keywords` / `phase` / `summary` / `raw` 等状态输入；非足球仍基于 `phase_keywords` / `phase` 判定。新增的 `events` 字段仅供 rendering 与 dedup 使用，**不参与**状态判定。即「事件不影响状态」：哪怕一场比赛抓到再多 goal/foul/sub/commentary 事件，`classify_state` 也**绝不**因 events 改变返回值。这条规则确保事件流是状态判定的下游旁路、而不是新数据源（详见 §extract_score_snapshot 排除列表与 §Hard constraints / break-risks）。
 
 #### `read_state_file(path)`
 
