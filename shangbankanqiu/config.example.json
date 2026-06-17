@@ -28,7 +28,7 @@
   "commentary_dedup_window": 30,
   "_comment_commentary_style": "播报风格: 'events_only' = 仅在比分变化或出现进球/犯规等重大事件时推送（默认）; 'play_by_play' = 文字直播模式，像解说员一样每轮推送比赛进程",
   "commentary_style": "events_only",
-  "_comment_play_by_play_interval": "文字直播模式推荐的轮询间隔（秒）。当 poll_interval_seconds 仍为默认 180 时，play_by_play 模式自动使用此值。范围 ≥ 60",
+  "_comment_play_by_play_interval": "文字直播模式推荐的轮询间隔（秒）。当 poll_interval_seconds 仍为默认 120 时，play_by_play 模式自动使用此值。范围 ≥ 60",
   "play_by_play_default_poll_interval_seconds": 90,
   "_comment_search_freshness_boost": "是否启用 Stage A+ Fallback（实时源精准搜索）。true=当 Stage A 没找到文字直播 URL 时，自动用 site: 限定搜索精准定位中文实时源（虎扑/新浪），减少进球延迟检测；false=关闭 fallback，回到旧行为",
   "search_freshness_boost": true,

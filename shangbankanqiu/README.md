@@ -97,7 +97,7 @@ cp config.example.json config.json
 
   // === 播报风格 ===
   "commentary_style": "events_only",       // 播报风格: "events_only" = 仅在比分变化/重大事件时推送（默认）; "play_by_play" = 文字直播模式，像解说员一样每轮推送比赛进程
-  "play_by_play_default_poll_interval_seconds": 90,  // 文字直播模式推荐的轮询间隔（秒），当 poll_interval_seconds 仍为默认180时自动使用此值
+  "play_by_play_default_poll_interval_seconds": 90,  // 文字直播模式推荐的轮询间隔（秒），当 poll_interval_seconds 仍为默认120时自动使用此值
 
   // === 实时性优化 ===
   "search_freshness_boost": true,          // 是否启用 Stage A+ Fallback：当主搜索没找到文字直播 URL 时，自动用 site: 限定搜索精准定位中文实时源（虎扑/新浪），减少进球延迟检测。设为 false 关闭

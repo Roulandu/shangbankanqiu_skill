@@ -198,7 +198,7 @@ Start-Sleep -Seconds 180   # Windows PowerShell
 | `max_events_per_msg` | integer | 6 | 1–20 | 每次推送最多附带的事件条数。钉钉 markdown `text` 字段约 **20KB** 硬上限——`events_only` 模式推荐 4–8（再多容易被钉钉服务端截断；详见 §钉钉 18000 字节 size guard）；`play_by_play` 模式推荐 8–12（文字直播事件更多，但仍需注意钉钉 size guard）。 |
 | `commentary_dedup_window` | integer | 30 | 1–200 | `seen_event_ids` ring buffer 记多少**轮**的事件 id_hash；buffer 容量 `cap = commentary_dedup_window × max_events_per_msg`。默认 30 × 6 = 180 条 id_hash（state 文件约 9KB）。详见 §state file schema。 |
 | `commentary_style` | string | `"events_only"` | `"events_only"` / `"play_by_play"` | 播报风格。`events_only` = 仅在比分变化或出现进球/犯规等重大事件时推送（当前默认行为）。`play_by_play` = 文字直播模式——像文字解说员一样每轮推送比赛进程，即使比分未变也有叙述更新；LLM 提取更细粒度的事件类型（射门/扑救/角球等），且每轮至少产一条 `commentary` 类型事件描述当前局势。详见 §Stage B LLM prompt 变体 与 §render_live 3×2 状态表。 |
-| `play_by_play_default_poll_interval_seconds` | integer | 90 | ≥ 60 | 文字直播模式推荐的轮询间隔（秒）。当 `commentary_style == "play_by_play"` 且用户未自定义 `poll_interval_seconds`（仍为默认值 180）时，自动使用此值代替，使文字直播更「实时」。用户显式设置了非 180 的 `poll_interval_seconds` 时，以用户设置为准。 |
+| `play_by_play_default_poll_interval_seconds` | integer | 90 | ≥ 60 | 文字直播模式推荐的轮询间隔（秒）。当 `commentary_style == "play_by_play"` 且用户未自定义 `poll_interval_seconds`（仍为默认值 120）时，自动使用此值代替，使文字直播更「实时」。用户显式设置了非 120 的 `poll_interval_seconds` 时，以用户设置为准。 |
 | `search_freshness_boost` | boolean | `true` | `true` / `false` | 是否启用 Stage A+ Fallback（实时源精准搜索）。`true`（默认）：当 Stage A 主搜索没找到文字直播 URL 时，自动用 `site:` 限定搜索精准定位中文实时源（虎扑/新浪），大幅减少「进球后长时间检测不到」的问题。`false`：关闭此 fallback，回到旧行为（Stage A 嗅探不到 URL 时直接 `events=[]`）。详见 §build_pbp_search_query 与 FAQ Q1。 |
 | `providers.football.priority` | array&lt;string&gt; | 见示例 | provider 名称列表 | 足球数据源优先级。建议按 `sportradar_extended` → `sportmonks` / `api_football` → `football_data_org` → `web` 排序；所有 API provider 都不可用时必须回退到 `web_search` / `webfetch` 旧路径。 |
 | `providers.football.*.enabled` | boolean | `false` | `true` / `false` | 是否启用对应足球 API provider。默认全部关闭；只有显式设为 `true` 且配置了可用 `api_key` 时才允许尝试该 provider。 |
@@ -1503,52 +1503,58 @@ UNKNOWN_LIVE
 
 - `PAUSED` / `HT` / `Half Time` / `Halftime` / `中场` => `HALFTIME`
 - `HALFTIME` 继续轮询，永不判 final，永不 cleanup
-- 如果 web summary 同时出现 `HT` 与 `Final` / `FT`，优先 `HALFTIME`，除非结构化 API 明确返回 `FINISHED`
+- 如果 `football_status` / `phase` / `phase_keywords` 含 `HT` / `PAUSED` / `Half Time` / `Halftime` / `中场`，优先 `HALFTIME`；`summary` / `raw` 里的 `Final` / `FT` 噪声不得覆盖半场证据，除非结构化 API 明确返回 `FINISHED`
 - `UNKNOWN_LIVE` 是直播态；宁可继续轮询，也不要过早停止
 
 终场规则：
 
-- 只有 `FINISHED` / `FT` / `Full-Time` / `AET` / `AP`，或强多源终场确认，才映射为 `FINISHED`
+- 只有结构化/native `football_status` / `phase` / `phase_keywords` 明确给出 `FINISHED` / `FT` / `Full-Time` / `AET` / `AP`，或强多源终场确认，才映射为 `FINISHED`
+- `summary` / `raw` 单独出现 final-like 文本不得结束比赛；若同时存在半场/直播证据，必须继续轮询
 - events never decide status；goal/card/sub/commentary 等事件永不参与状态判定
 
 ```text
 normalize_football_status(match):
-    fields = [
-        match.get("football_status", ""),
-        match.get("phase", ""),
-        " ".join(match.get("phase_keywords", []) or []),
-        match.get("summary", ""),
-        match.get("raw", ""),
-    ]
-    text = " ".join(fields)
+    status_raw = match.get("football_status", "") or ""
+    phase_raw = match.get("phase", "") or ""
+    keyword_text = " ".join(match.get("phase_keywords", []) or [])
+    structured_text = " ".join([status_raw, phase_raw, keyword_text])
+    noisy_text = " ".join([match.get("summary", "") or "", match.get("raw", "") or ""])
     source = match.get("source", "") or "web"
 
+    if structured_text contains any of {"PAUSED", "HT", "Half Time", "Halftime", "中场"}:
+        return "HALFTIME"
+
     if source in {"sportmonks", "api_football", "football_data_org", "sportradar_extended"}:
-        if text contains structured status in {"FINISHED", "FT", "Full-Time", "AET", "AP"}:
+        if structured_text contains structured status in {"FINISHED", "FT", "Full-Time", "AET", "AP"}:
             return "FINISHED"
-        if text contains structured status in {"SCHEDULED", "TIMED", "NS"}:
+        if structured_text contains structured status in {"SCHEDULED", "TIMED", "NS"}:
             return "SCHEDULED"
 
-    if text contains any of {"PAUSED", "HT", "Half Time", "Halftime", "中场"}:
-        return "HALFTIME"
-    if text contains any of {"1H", "First Half", "上半场"}:
+    if structured_text contains any of {"1H", "First Half", "上半场"}:
         return "FIRST_HALF"
-    if text contains any of {"2H", "Second Half", "下半场"}:
+    if structured_text contains any of {"2H", "Second Half", "下半场"}:
         return "SECOND_HALF"
-    if text contains any of {"ET", "Extra Time", "加时"}:
+    if structured_text contains any of {"ET", "Extra Time", "加时"}:
         return "EXTRA_TIME"
-    if text contains any of {"PEN", "Penalty Shootout", "点球"}:
+    if structured_text contains any of {"PEN", "Penalty Shootout", "点球"}:
         return "PENALTY_SHOOTOUT"
-    if text contains any of {"SUSPENDED", "Suspended", "中断"}:
+    if structured_text contains any of {"SUSPENDED", "Suspended", "中断"}:
         return "SUSPENDED"
-    if text contains any of {"IN_PLAY", "INPLAY", "LIVE"}:
+    if structured_text contains any of {"IN_PLAY", "INPLAY", "LIVE"}:
         return "UNKNOWN_LIVE"
-    if text contains any of {"Live", "直播中", "进行中"} or match.get("minute"):
+    if structured_text contains any of {"Live", "直播中", "进行中"} or match.get("minute"):
         return "UNKNOWN_LIVE"
-    if text contains any of {"FINISHED", "FT", "Full-Time", "AET", "AP"}:
+
+    if structured_text contains any of {"FINISHED", "FT", "Full-Time", "AET", "AP"}:
         return "FINISHED"
-    if text contains any of {"未开始", "SCHEDULED"}:
+    if structured_text contains any of {"未开始", "SCHEDULED"}:
         return "SCHEDULED"
+
+    if noisy_text contains any of {"PAUSED", "HT", "Half Time", "Halftime", "中场"}:
+        return "HALFTIME"
+    if noisy_text contains any of {"1H", "First Half", "上半场", "2H", "Second Half", "下半场", "Live", "直播中", "进行中"}:
+        return "UNKNOWN_LIVE"
+
     if strong_multi_source_final_confirmation(match):
         return "FINISHED"
     return "SCHEDULED"
@@ -2649,7 +2655,7 @@ A: 这是 play_by_play 模式的设计意图。用户选择文字直播，就是
 
 **Q5: play_by_play 模式会不会刷屏太频繁？**
 
-A: 有三层控制：(1) `poll_interval_seconds` 在 play_by_play 模式下自动从 180s 降为 90s（可通过 `play_by_play_default_poll_interval_seconds` 配置或手动设 `poll_interval_seconds` 自定义）；(2) `max_events_per_msg` 控制每条消息的事件数上限；(3) 钉钉 18KB size guard 自动截断过长消息。如果仍然觉得太频繁，调大 `poll_interval_seconds` 或切回 `events_only` 模式即可。
+A: 有三层控制：(1) `poll_interval_seconds` 在 play_by_play 模式下自动从 120s 降为 90s（可通过 `play_by_play_default_poll_interval_seconds` 配置或手动设 `poll_interval_seconds` 自定义）；(2) `max_events_per_msg` 控制每条消息的事件数上限；(3) 钉钉 18KB size guard 自动截断过长消息。如果仍然觉得太频繁，调大 `poll_interval_seconds` 或切回 `events_only` 模式即可。
 
 **Q6: 为什么进球后很长时间才检测到？`search_freshness_boost` 有什么用？**
 
