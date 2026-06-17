@@ -817,7 +817,7 @@ def decorate_web_snapshot(matches):
 
 - Status: highest-priority structured provider wins; low-confidence FINISHED cannot override higher-confidence HALFTIME/live unless multi-source final confirmation.
 - Score: higher priority and lower source_freshness_seconds wins; conflicts log warning and continue polling.
-- Events: dedupe by `match_key + minute/ts + type + team/player + normalized_text`.
+- Events: provider/Stage B events must compute the existing `id_hash` byte-for-byte (`sha1(match_key + "|" + ts + "|" + text)[:12]`); merging/deduping is by `id_hash`. Any normalization may only happen before final `ts` / `text` are produced.
 - Fine-grained actions only retained when extended_timeline or original commentary supports them.
 - `football_data_org.status_only=true` reads status only and does not merge events.
 
@@ -1612,7 +1612,7 @@ except (parse error / IO error):
 ```text
 {
   "score": "<score_snapshot>",
-  "last_push_ts": "2026-06-17T20:00:00+08:00",
+  "ts": "2026-06-17T20:00:00+08:00",
   "seen_event_ids": ["..."],
   "pbp_urls": {"<match_key>": "<url>"},
   "provider_cache": {
