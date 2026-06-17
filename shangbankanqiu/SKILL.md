@@ -283,13 +283,14 @@ while poll_idx < config.max_polls:
     # 任何 Stage B 子步异常一律 graceful=[]——**绝不**让 Stage B 失败影响第 2 步的 push gate。
     if config.include_events:
         for m in fresh:
+            provider_events = m.get("events", []) or []  # provider 预置事件；Stage B 只能补充/合并，不得覆盖
             # 1.5a. 仅对正在直播的场次抓事件；未开始/已完结跳过。
             # P2-2：match dict 没有 .state 字段；用 phase_keywords（§parse_search_result）判断。
             phase_kws = m.get("phase_keywords", []) or []
             live_kws  = {"Live", "直播中", "Q1", "Q2", "Q3", "Q4", "OT", "1H", "2H",
                          "上半场", "下半场", "加时", "进行中", "中场"}
             if not any(kw in phase_kws for kw in live_kws):
-                m["events"] = []
+                m["events"] = provider_events
                 continue
             # 1.5b. 从 Stage A snippets 选 play-by-play URL（按 §Stage A 5 行优先级表）
             #       优先级：URL 缓存 > Stage A 嗅探 > Stage A+ 补搜
@@ -345,7 +346,7 @@ while poll_idx < config.max_polls:
                     persisted["pbp_url_empty_streaks"][match_key_for_url] = 0
 
                 if pbp_url is None:
-                    m["events"] = []
+                    m["events"] = provider_events
                     continue
                 page_md    = webfetch(pbp_url, format="markdown", timeout_seconds=15)
                 # P0-2 (Oracle Round 12): 函数签名是 (page_md, match_key, schema)；不接受 cap。
@@ -356,7 +357,15 @@ while poll_idx < config.max_polls:
                     schema    = "see §parse_search_result event schema (id_hash + ts + team + type + text)",
                 )
                 cap_b      = (3 if config.get("commentary_style", "events_only") == "play_by_play" else 2) * config["max_events_per_msg"]    # play_by_play: 3× 防丢(默认24); events_only: 2×(默认12)
-                m["events"] = raw_events[-cap_b:]
+                # merge provider events + Stage B events by id_hash；Task 5 会扩展多源合并细则。
+                merged_events = []
+                seen_event_hashes = set()
+                for e in provider_events + raw_events[-cap_b:]:
+                    eid = e.get("id_hash")
+                    if eid and eid not in seen_event_hashes:
+                        merged_events.append(e)
+                        seen_event_hashes.add(eid)
+                m["events"] = merged_events
                 # 更新 URL 缓存空轮计数器：有事件 → 重置；无事件 → 递增
                 if "pbp_url_empty_streaks" not in persisted:
                     persisted["pbp_url_empty_streaks"] = {}
@@ -366,7 +375,7 @@ while poll_idx < config.max_polls:
                     persisted["pbp_url_empty_streaks"][match_key_for_url] = \
                         persisted["pbp_url_empty_streaks"].get(match_key_for_url, 0) + 1
             except Exception:
-                m["events"] = []                          # graceful=[]，绝不 raise
+                m["events"] = provider_events             # graceful=provider_events；绝不 raise
     else:
         for m in fresh:
             m["events"] = []                              # include_events=false → 退化成纯比分模式
@@ -708,7 +717,7 @@ Provider capability flags:
 sportradar_extended → sportmonks → api_football → football_data_org → web
 ```
 
-Normalized match snapshot（所有 provider / web fallback 输出都必须归一化为 match dict list，单场 shape 如下）:
+Normalized match snapshot（所有 provider / web fallback 输出都必须归一化为 match dict list；metadata 字段允许 sparse/optional，单场 shape 如下）:
 
 ```json
 {
@@ -730,9 +739,10 @@ Normalized match snapshot（所有 provider / web fallback 输出都必须归一
 
 字段约定：
 - `football_status` 是 provider 原始/归一化足球状态的承载位，供后续 `classify_state / football_status_machine` 参考；本节只定义数据流，不展开 Task 3 的状态机细节。
-- `source_freshness_seconds` 表示 provider 数据相对当前轮询时刻的估计新鲜度；未知时可为 `null`，但字段必须存在。
+- `source` / `capabilities` 应由 provider 或 `decorate_web_snapshot` 设置；`source_freshness_seconds` 表示 provider 数据相对当前轮询时刻的估计新鲜度，未知时可省略或为 `null`。
 - `events` 使用 §parse_search_result event schema；provider 没有事件能力时填 `[]`，不要阻塞 Stage B。
 - `capabilities` 只声明本次 snapshot 实际可用能力，不要把 provider 理论能力硬塞进去。
+- provider 预置的 `events` / `commentary` 不应被 Stage B 覆盖；Stage B 只追加补充事件，并按 `id_hash` 与 `provider_events` 合并。若 provider 和 Stage B 都没有事件，最终才允许 `m["events"] = []`。
 
 ```text
 def build_football_provider_chain(config):
@@ -773,7 +783,7 @@ def fetch_football_snapshot(match_type, follow, config):
     for provider in build_football_provider_chain(config):
         if provider["name"] == "web":
             raw = web_search(build_query(match_type, follow))
-            return parse_search_result(raw)
+            return decorate_web_snapshot(parse_search_result(raw))
 
         try:
             raw = fetch_provider_once(provider, match_type, follow)
@@ -786,7 +796,15 @@ def fetch_football_snapshot(match_type, follow, config):
 
     # Defensive fallback; build_football_provider_chain should already include web.
     raw = web_search(build_query(match_type, follow))
-    return parse_search_result(raw)
+    return decorate_web_snapshot(parse_search_result(raw))
+
+
+def decorate_web_snapshot(matches):
+    for m in matches:
+        m["source"] = "web"
+        m["capabilities"] = ["score_status", "events", "commentary"]
+        # source_freshness_seconds is optional/sparse for web; only set it if known.
+    return matches
 ```
 
 `fetch_provider_once` / `normalize_provider_response` 是 host-agent protocol steps，而不是 SDK 要求：Agent 可以用自身可用的 HTTP/webfetch/shell 网络能力短超时调用 provider，也可以在宿主不支持直接 API 调用时直接跳过 provider。每次 provider 尝试都必须短 timeout、无副作用、失败不抛出到主循环；只有最终 `web` fallback 仍失败时，才进入主流程已有的连续失败计数。
